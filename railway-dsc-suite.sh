@@ -469,7 +469,7 @@ PY
     { if [ -n "$n" ]; then head -n "$((n-1))" "$SELF"; else cat "$SELF"; fi
       echo "$MARKER"
       tar -czf - -C "$st" . ; } > "$out.tmp" || die "packing failed"
-    chmod 755 "$out.tmp"; mv -f "$out.tmp" "$out"
+    chmod 700 "$out.tmp"; mv -f "$out.tmp" "$out"     # contains the bridge's TLS key: owner only
     ok "Created $out ($(du -h "$out" | cut -f1))"
     info "Copy it to the other PC and run:  bash $(basename "$out") install"
 }
@@ -583,9 +583,12 @@ trust_certs() {
              "$U_HOME"/.librewolf/* "$U_HOME"/.waterfox/*; do
         [ -f "$d/cert9.db" ] && dbs+=("$d")
     done
-    local certs=("eOfficeCA2022|$PROXY_DIR/ca.pem|CT,C,C"
-                 "IREPSSigner eMudhra Local CA|$IREPS_DIR/certificate.crt|CT,C,C"
-                 "CrisSigner 127.0.0.1|$CRIS_DIR/certificate.crt|CTP,C,C")
+    # Minimum trust only: the two vendor CAs may vouch for web servers (C) and nothing else
+    # (no client-auth, e-mail or code-signing trust); the CrisSigner certificate is a
+    # self-signed leaf whose key ships with the app, so it is trusted as that one peer (P) only.
+    local certs=("eOfficeCA2022|$PROXY_DIR/ca.pem|C,,"
+                 "IREPSSigner eMudhra Local CA|$IREPS_DIR/certificate.crt|C,,"
+                 "CrisSigner 127.0.0.1|$CRIS_DIR/certificate.crt|P,,")
     n=0
     for d in "${dbs[@]}"; do
         for item in "${certs[@]}"; do
