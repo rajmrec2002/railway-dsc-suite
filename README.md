@@ -66,6 +66,23 @@ NIC's jar is never modified. Everything is done around it:
 | The signer listens on all network interfaces by default | binds it to the loopback address only (`--server.address`) |
 | Old setups (7.0.6 service, v4 compatibility bridge on 55101, vendor `/etc/profile.d` autostart hook) conflict | disabled automatically; their files are kept |
 
+## Look and scaling
+
+- **CrisSigner and IREPSSigner** ask Java for the "Windows" look, which does not exist on
+  Linux. The suite puts a small stand-in first on their class path. It is GTK
+  underneath (source in `extras/gtk-look/`), so their windows follow the desktop theme
+  (e.g. Ubuntu's Yaru) and fonts.
+- **Scale follows the desktop automatically** (`DSC_UI_SCALE=auto`). It is read from
+  `Xft.dpi` (GNOME sets 192 for 2x with native XWayland scaling, and 96 when the
+  compositor scales X apps itself), then `GDK_SCALE`, then GNOME's `scaling-factor`.
+  Java's GTK look would otherwise size text from the desktop DPI *and* apply the
+  scale again, giving double-size text. The stand-in corrects this, so text matches
+  native apps.
+- To change this, edit `~/.config/railway-dsc/suite.conf` (`DSC_UI_SCALE=2`,
+  `DSC_LOOK=metal`) and run `railway-dsc install`.
+- **The eOffice PIN window** runs on Java 8, which cannot scale Swing on Linux, so it
+  keeps NIC's fixed pixel size. It is small on HiDPI screens but works.
+
 ## Self-healing
 
 - Every service restarts within 5 seconds if it exits or is killed.
