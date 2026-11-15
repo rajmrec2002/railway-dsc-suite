@@ -1,5 +1,9 @@
 # Railway DSC Signer Suite
 
+> **Unofficial.** Not made, endorsed or supported by NIC, CRIS, eMudhra or Indian Railways.
+> It installs those vendors' own signer programs, which you must obtain yourself, and
+> makes them work on Linux. See [NOTICE](NOTICE).
+
 One script that installs, repairs and keeps running the three Indian Railways
 digital-signature (DSC) signer services on Linux. It is written for Ubuntu and also
 handles Debian/Mint/Pop!_OS, Fedora/RHEL, openSUSE, Arch, Alpine and Void.
@@ -11,7 +15,30 @@ handles Debian/Mint/Pop!_OS, Fedora/RHEL, openSUSE, Arch, Alpine and Void.
 | CrisSigner | `wss://127.0.0.1:2039` | CRIS portals |
 | IREPSSigner | `wss://127.0.0.1:2175` | IREPS |
 
-## Quick start (Ubuntu)
+## Quick start on a new PC (Ubuntu)
+
+1. Download this repository (green **Code** button → *Download ZIP*) and unpack it, or
+   `git clone` it.
+2. Put the vendors' installers in `~/Downloads`:
+
+   | Signer | File (exact version the kit is made for) |
+   |---|---|
+   | eOffice 4.1.8 | `Digital Signer Service 4.1.8_x64.msi` (NIC) |
+   | eOffice 7.0.6 (optional) | `DigitalSignerService_7.0.6_Ubuntu_Installer.zip` (NIC). It also carries the renewed HTTPS certificate 4.1.8 needs |
+   | CrisSigner | `CrisSigner.msi`, SHA-256 `aaa1c7aa…` |
+   | IREPSSigner | `IREPSSigner.msi` of 04-11-2026, SHA-256 `1969e090…` (31.6 MB) |
+
+3. Install your token's Linux driver (Longmai mToken: `/usr/lib/libcryptoid_pkcs11.so`).
+4. In the unpacked folder, run as your normal desktop user:
+
+       bash railway-dsc-suite.sh install
+
+The installers are recognised by checksum, whatever their file names. CRIS and IREPS
+are built from their Windows installers plus the [Linux patch kit](#linux-patch-kit-for-cris-and-ireps).
+If only `CrisSigner.msi` is present, its extra open-source libraries are downloaded
+from Maven Central, each pinned by checksum.
+
+## Quick start on a PC that already has the signers (Ubuntu)
 
 1. Download the official **eOffice DSC Signer Service 4.1.8 Windows installer**
    (`Digital Signer Service 4.1.8_x64.msi`) into `~/Downloads`. The program inside
@@ -131,14 +158,45 @@ Start with `railway-dsc doctor`. Common messages from the portals:
 Don't click **Register DSC** repeatedly while debugging: each click deactivates the
 currently active registration.
 
+## Linux patch kit for CRIS and IREPS
+
+eMudhra ships CrisSigner and IREPSSigner only as Windows installers. The Java programs
+inside them need a few changes to run on Linux. `kit/` holds **only those changed
+parts** (about 1.4 MB) and a recipe:
+
+| Part | What changed |
+|---|---|
+| main program (`*_app.jar`, from the installer's `.exe`) | 6 classes of the bundled Java-WebSocket server (TLS handshake errors no longer kill the server); a stand-in for the Windows look-and-feel |
+| `docsigner4.4_Cris.jar`, `pdfwebsigner4.5_CRIS.jar` | PKCS#11/token handling for Linux tokens (e.g. Longmai mToken), PIN prompts that stop before a token lockout, token-details actions, response logging clipped to 120 characters |
+| `sunmscapi.jar` (CRIS-only installs) | replaced by a 1-class stub (`kit/stubs/src`). The vendor copy is an Oracle JRE part, used only on Windows code paths |
+
+`kit/kittool.py apply` rebuilds the Linux folder from **your** installer and checks
+every entry of every jar against SHA-256 values recorded from a working installation.
+A different installer version is refused. The kit contains no vendor file that is
+unchanged, and no key or certificate: those come from your own installer.
+
+Review before publishing (2026-11-15): no new network destinations, no new shell
+commands (only a Windows registry query, which does nothing on Linux), and the PIN is
+held in memory only. This was a targeted review of the changed classes, not a full
+audit.
+
+Maintainers rebuild the kit on a working machine with
+`python3 -I kit/kittool.py build --app cris|ireps --msi … [--aux-msi …] --linux-dir … --out kit/<app>`.
+
 ## What is and is not in this repository
 
-Only the script is here. The signer programs, Java runtimes, TLS keys and token
-drivers are vendor software and are **not** included. The script takes them from the
-official installers, from a `.run` bundle you build yourself, or from an existing
-installation.
+The scripts, the patch kit (changed classes only), and two small stubs written for this
+project are here. The signer programs, Java runtimes, TLS keys and token drivers are
+vendor software and are **not** included. The suite takes them from the official
+installers, from a `.run` bundle you build yourself, or from an existing installation.
 
 ## Test status (2026-11-15, Ubuntu 26.04)
+
+- Fresh-PC test: in a throwaway home with only the vendor installers in `~/Downloads`,
+  install set up eOffice 4.1.8 and 7.0.6, CrisSigner and IREPSSigner. The rebuilt CRIS
+  and IREPS were content-identical to the working copies, and started and answered on
+  ports 2039/2175 (including the CRIS-only variant with Maven libraries and the stub).
+  Signing through the rebuilt CRIS/IREPS has not been tried yet.
 
 - eOffice 4.1.8 set up this way signed and forwarded a file on a railway eOffice portal.
 - Tested in a throwaway home directory:
