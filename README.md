@@ -58,6 +58,31 @@ from Maven Central, each pinned by checksum.
 Run `install` again at any time. It repairs whatever is broken and leaves healthy
 parts alone (`repair` is the same command).
 
+## DSC tokens and drivers
+
+The suite works with any user's DSC: certificates are read from the token at signing
+time, and nothing user-specific is stored or bundled. Each signer is pointed at the
+driver that matches the **token plugged in** (checked whenever a signer starts):
+
+| Token (USB vendor) | Driver used | Status |
+|---|---|---|
+| Longmai **mToken** CryptoID (055c) | `/usr/lib/libcryptoid_pkcs11.so` (in the `.run` bundle) | tested |
+| Feitian **ePass2003 / ePass2003 Auto**, HYP2003 (096e) | Feitian's `libcastle.so.1.0.0` if installed, otherwise **OpenSC** (installed automatically, open source; supports the ePass2003) | not tested with a real token |
+| WatchData **ProxKey** / TrustKey (163c) | WatchData's `libwdpkcs_*` if installed | not tested; see below |
+| SafeNet eToken (0529), Gemalto/Thales IDPrime (08e6), JaCarta (24dc), smart-card readers | vendor driver if installed; OpenSC for Gemalto cards and readers | not tested |
+
+- **Feitian's own ePass2003 driver:** `railway-dsc install --epass-zip=ePass2003-Linux-x64.zip`.
+  Only the library is installed; Feitian's scripts, which edit hotplug files, are not run.
+  A zip already in `~/Downloads` is used automatically when an ePass2003 is plugged in.
+- **WatchData ProxKey:** install WatchData's Ubuntu package from your supplier (e.g. the
+  ProxKey support site). It is not automated: WatchData's installer adds its own
+  smart-card daemon, a login hook and a world-writable folder, and its driver needs
+  `libxml2.so.2`, which Ubuntu 26.04 no longer ships.
+- **Two different tokens:** the first one plugged in wins. Set `P11_LIB=/path/to/driver.so`
+  in `~/.config/railway-dsc/suite.conf` to force one, then `railway-dsc restart`.
+- `railway-dsc doctor` shows, for each plugged token, which driver will be used or what
+  to install.
+
 ## Choosing the eOffice signer version
 
 Different eOffice portals ask for different signer versions. `install` asks which one

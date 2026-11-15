@@ -34,7 +34,7 @@
 set -u
 set -o pipefail
 
-SUITE_VERSION="4.3.0"
+SUITE_VERSION="4.4.0"
 MARKER="__PAYLOAD_BELOW__"
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
 
@@ -167,9 +167,31 @@ P11_CANDIDATES="/usr/lib/libcryptoid_pkcs11.so /usr/lib/libcastle.so.1.0.0 /usr/
  /usr/lib/libeTPkcs11.so /usr/lib/libeToken.so /usr/lib/pkcs11/libgtop11dotnet.so /usr/lib/libgtop11dotnet.so
  /usr/lib/x86_64-linux-gnu/opensc-pkcs11.so /usr/lib64/opensc-pkcs11.so /usr/lib64/pkcs11/opensc-pkcs11.so
  /usr/lib/opensc-pkcs11.so /usr/lib/pkcs11/opensc-pkcs11.so"
-find_p11_lib() {
-    local l
-    for l in ${P11_LIB:-} $P11_CANDIDATES; do [ -f "$l" ] && { echo "$l"; return 0; }; done
+OPENSC_LIBS="/usr/lib/x86_64-linux-gnu/opensc-pkcs11.so /usr/lib64/opensc-pkcs11.so /usr/lib64/pkcs11/opensc-pkcs11.so
+ /usr/lib/opensc-pkcs11.so /usr/lib/pkcs11/opensc-pkcs11.so /usr/lib/aarch64-linux-gnu/opensc-pkcs11.so"
+EPASS_ZIP_SHA="6d69729a4ca1354b2a9929a9cb18b7bcebb54dfdc06f2b85d95d1f3053d01654"   # Feitian/EnterSafe ePass2003-Linux-x64.zip
+CASTLE_LIB="/usr/lib/libcastle.so.1.0.0"
+plugged_vids() { cat /sys/bus/usb/devices/*/idVendor 2>/dev/null | sort -u; }
+p11_for_vid() {               # USB vendor id of the plugged token -> its drivers, best first
+    case "$1" in
+        055c) echo "/usr/lib/libcryptoid_pkcs11.so /usr/lib/libmTokenPKCS11.so";;
+        096e) echo "/usr/lib/libcastle.so.1.0.0 /usr/lib/libcastle.so /usr/lib/x86_64-linux-gnu/libcastle.so /usr/lib64/libcastle.so $OPENSC_LIBS";;
+        163c) echo "/usr/lib/WatchData/ProxKey/lib/libwdpkcs_SignatureP11.so /usr/lib/WatchData/TRUSTKEY/lib/libwdpkcs_TRUSTKEY.so /usr/lib/WatchData/eMudhra_3.4.3/lib/libwdpkcs_eMudhra_343.so /usr/lib/WatchData/PROXKey/lib/libwdpkcs.so /usr/lib/libwdpkcs.so";;
+        0529) echo "/usr/lib/libeTPkcs11.so /usr/lib/libeToken.so";;
+        08e6) echo "/usr/lib/pkcs11/libgtop11dotnet.so /usr/lib/libgtop11dotnet.so $OPENSC_LIBS";;
+        24dc) echo "/usr/lib/libjcPKCS11-2.so /usr/lib/x86_64-linux-gnu/libjcPKCS11-2.so";;
+        04e6|072f) echo "$OPENSC_LIBS";;                      # smart-card readers
+    esac
+}
+find_p11_lib() {              # P11_LIB (suite.conf) > driver matching the plugged token > first one found
+    local l v known=0 c
+    for l in ${P11_LIB:-}; do [ -f "$l" ] && { echo "$l"; return 0; }; done
+    for v in $(plugged_vids); do
+        c=$(p11_for_vid "$v"); [ -n "$c" ] && known=1
+        for l in $c; do [ -f "$l" ] && { echo "$l"; return 0; }; done
+    done
+    [ $known = 1 ] && return 1        # a known token is plugged but its driver is missing: never guess another's
+    for l in $P11_CANDIDATES; do [ -f "$l" ] && { echo "$l"; return 0; }; done
     return 1
 }
 
@@ -379,10 +401,10 @@ write_launcher() {
         echo '# usage: launch.sh eoffice|cris|ireps'
         local v
         for v in U_HOME LAF_JAR E7_DIR E7_JAR E7_LOGS EOFFICE_DIR EOFFICE_JAR EOFFICE_JKS EOFFICE_LOGS CRIS_DIR IREPS_DIR CONF_FILE \
-                 JRE8_DIR JRE17_DIR LEGACY_706_DIR HOSTS_NAME P11_CANDIDATES; do
+                 JRE8_DIR JRE17_DIR LEGACY_706_DIR HOSTS_NAME P11_CANDIDATES OPENSC_LIBS MTOKEN_LIB; do
             printf '%s=%q\n' "$v" "${!v}"
         done
-        declare -f java_major java_has_gui find_java8 find_java_modern find_p11_lib
+        declare -f java_major java_has_gui find_java8 find_java_modern find_p11_lib plugged_vids p11_for_vid
     } > "$LAUNCH"
     cat >> "$LAUNCH" <<'LAUNCH_EOF'
 SVC="${1:-}"
@@ -442,6 +464,11 @@ if [ "$SVC" = eoffice7 ]; then
     J=$(find_java_modern) || { echo "No Java 11+ runtime with GUI libraries found - run: railway-dsc install"; exit 1; }
     mkdir -p "$E7_DIR" "$E7_LOGS"
     cd "$E7_DIR" || exit 1                                   # conf/ (token list) is read from here
+    if P11=$(find_p11_lib) && ! grep -qs "^1.path=$P11\$" conf/all_tokens.properties; then   # follow the plugged token
+        mkdir -p conf; T=Token; [ "$P11" = "$MTOKEN_LIB" ] && T=mToken
+        printf '1.name=%s\n1.path=%s\n1.status=1\n' "$T" "$P11" > conf/all_tokens.properties
+        printf 'service.start=false\nservice.locale=en_in\nprocess.type=custom\nselected.token.name=%s\nselected.token.path=%s\nused.token.name=%s\nused.token.path=%s\n' "$T" "$P11" "$T" "$P11" > conf/default_token.properties
+    fi
     exec >>"$E7_LOGS/output.log" 2>>"$E7_LOGS/errorOutput.log"
     # java.awt.headless=true is what NIC's own launcher passes; the app switches it back itself.
     exec "$J" "$NOATK" "${UI[@]}" -Djava.awt.headless=true -jar "$E7_JAR" --server.address="$BIND"
@@ -451,6 +478,9 @@ if [ "$SVC" = eoffice ]; then
     J8=$(find_java8) || { echo "No Java 8 runtime with GUI libraries found - run: railway-dsc install"; exit 1; }
     mkdir -p "$EOFFICE_LOGS"
     cd "$EOFFICE_DIR" || exit 1                              # pkcs11cfg is read from here
+    if P11=$(find_p11_lib) && ! grep -qs "^library = $P11\$" pkcs11cfg; then              # follow the plugged token
+        printf 'name = DSCToken\nlibrary = %s\n' "$P11" > pkcs11cfg
+    fi
     exec >>"$EOFFICE_LOGS/output.log" 2>>"$EOFFICE_LOGS/error.log"
     # Java 8 cannot scale Swing on Linux; NIC's PIN window keeps its fixed pixel size.
     exec "$J8" "$NOATK" -jar "$EOFFICE_JAR" \
@@ -538,7 +568,7 @@ install_self() {              # copy this script WITHOUT the payload to ~/.local
 # The files the watchdog can restore by itself (everything except the Java runtimes).
 keep_list() {
     local f
-    for f in "$EOFFICE_JAR" "$EOFFICE_JKS" "$EOFFICE_P11CFG" "$EOFFICE_CA" "$E7_JAR"; do echo "$f"; done
+    for f in "$EOFFICE_JAR" "$EOFFICE_JKS" "$EOFFICE_CA" "$E7_JAR"; do echo "$f"; done
     find "$CRIS_DIR" "$IREPS_DIR" -maxdepth 2 -type f \( -name '*.jar' -o -name 'certificate.crt' \) 2>/dev/null
     echo "$LAUNCH"; echo "$PROBE"; echo "$LAF_JAR"
 }
@@ -738,8 +768,18 @@ xlibs_missing() {
     return 1
 }
 
-cmd_root() {                  # internal: runs under sudo.  args: user payload_dir need_java8 need_java17 need_cab
-    local user="$1" payload="$2" nj8="$3" nj17="$4" ncab="$5" home
+opensc_present() { local l; for l in $OPENSC_LIBS; do [ -f "$l" ] && return 0; done; return 1; }
+smartcard_stack_ok() { { have pcscd || [ -x /usr/sbin/pcscd ]; } && opensc_present; }
+find_epass_zip() {            # Feitian's Linux driver zip: explicit file, or the known version in ~/Downloads
+    local f
+    if [ -n "${OPT_EPASS_ZIP:-}" ]; then [ -f "$OPT_EPASS_ZIP" ] && echo "$OPT_EPASS_ZIP"; return; fi
+    while IFS= read -r f; do [ "$(sha "$f")" = "$EPASS_ZIP_SHA" ] && { echo "$f"; return 0; }; done < <(
+        find "$U_HOME/Downloads" "$U_HOME/Desktop" -maxdepth 4 -type f -iname 'ePass2003*Linux*.zip' 2>/dev/null)
+    return 1
+}
+
+cmd_root() {                  # internal: runs under sudo.  args: user payload_dir need_java8 need_java17 need_cab epass_zip
+    local user="$1" payload="$2" nj8="$3" nj17="$4" ncab="$5" epass="${6:-}" home
     [ "$(id -u)" -eq 0 ] || die "root phase must run as root"
     home=$(getent passwd "$user" | cut -d: -f6); [ -n "$home" ] || die "unknown user $user"
     set_user_paths "$home"
@@ -753,7 +793,17 @@ cmd_root() {                  # internal: runs under sudo.  args: user payload_d
     xlibs_missing && pkg_install $(pkgs_for xlibs)
     [ "$nj8" = 1 ] && pkg_install $(pkgs_for java8)
     [ "$nj17" = 1 ] && pkg_install $(pkgs_for java17)
-    if ! have pcscd && [ ! -x /usr/sbin/pcscd ]; then pkg_install $(pkgs_for smartcard); fi
+    smartcard_stack_ok || pkg_install $(pkgs_for smartcard)      # pcscd + CCID + OpenSC (ePass2003, smart cards)
+    if have systemctl && [ -d /run/systemd/system ]; then systemctl enable --now pcscd.socket >/dev/null 2>&1 || true; fi
+    if [ -n "$epass" ] && [ -f "$epass" ] && [ ! -f "$CASTLE_LIB" ] && [ "$(uname -m)" = x86_64 ]; then
+        # Only the PKCS#11 library is taken; Feitian's config scripts (hotplug edits) are not run -
+        # the suite's udev rule already gives the desktop user access to the token.
+        local t; t=$(mktemp -d)
+        if unzip -q -o "$epass" '*/redist/libcastle.so.1.0.0' -d "$t" 2>/dev/null && f=$(find "$t" -name libcastle.so.1.0.0 -print -quit) && [ -n "$f" ]; then
+            install -o root -g root -m 0644 "$f" "$CASTLE_LIB" && ok "Feitian ePass2003 driver installed ($CASTLE_LIB)"
+        else warn "could not find libcastle.so.1.0.0 in $epass"; fi
+        rm -rf "$t"
+    fi
 
     if [ ! -f "$MTOKEN_LIB" ] && [ -f "$payload/drivers/libcryptoid_pkcs11.so" ] && [ "$(uname -m)" = x86_64 ]; then
         install -o root -g root -m 0644 "$payload/drivers/libcryptoid_pkcs11.so" "$MTOKEN_LIB" && ok "mToken PKCS#11 driver installed"
@@ -985,11 +1035,12 @@ ask_eoffice() {               # interactive choice when nothing was chosen yet
 
 cmd_install() {
     local no_root=0 ui_scale="" a opt_eoffice=""
-    OPT_MSI=""; OPT_ZIP7=""; OPT_DOWNLOAD=1; OPT_CRIS_MSI=""; OPT_IREPS_MSI=""; OPT_KIT=""
+    OPT_MSI=""; OPT_ZIP7=""; OPT_DOWNLOAD=1; OPT_CRIS_MSI=""; OPT_IREPS_MSI=""; OPT_KIT=""; OPT_EPASS_ZIP=""
     for a in "$@"; do case "$a" in
         --no-root) no_root=1;; --ui-scale=*) ui_scale="${a#*=}";;
         --msi=*) OPT_MSI="${a#*=}";; --zip7=*) OPT_ZIP7="${a#*=}";; --no-download) OPT_DOWNLOAD=0;;
         --cris-msi=*) OPT_CRIS_MSI="${a#*=}";; --ireps-msi=*) OPT_IREPS_MSI="${a#*=}";; --kit=*) OPT_KIT="${a#*=}";;
+        --epass-zip=*) OPT_EPASS_ZIP="${a#*=}";;
         --eoffice=*) opt_eoffice="${a#*=}"
             case "$opt_eoffice" in 4|4.1*|7|7.0*|both|all) ;; *) die "--eoffice must be 4, 7 or both";; esac;;
         *) die "unknown option $a";; esac; done
@@ -1018,14 +1069,19 @@ cmd_install() {
     [ -d /etc/udev/rules.d ] && ! udev_rule_present && reasons+=("udev rule for DSC tokens")
     hosts_ok || reasons+=("/etc/hosts entry")
     hook_active && reasons+=("disable the vendor autostart hook")
+    smartcard_stack_ok || reasons+=("smart-card service + OpenSC (ePass2003 and smart cards)")
+    local epass=""                     # Feitian's driver: when asked for, or when an ePass2003 is plugged in
+    if [ -n "$OPT_EPASS_ZIP" ] || plugged_vids | grep -qx 096e; then epass=$(find_epass_zip || true); fi
+    [ -n "$OPT_EPASS_ZIP" ] && [ -z "$epass" ] && die "--epass-zip: file not found: $OPT_EPASS_ZIP"
+    [ -n "$epass" ] && [ ! -f "$CASTLE_LIB" ] && reasons+=("Feitian ePass2003 driver")
 
     if [ ${#reasons[@]} -gt 0 ] && [ $no_root = 0 ] && [ "${RDSC_TEST_NOROOT:-}" != 1 ]; then
         step "Administrator rights needed for: $(IFS=,; echo "${reasons[*]}" | sed 's/,/, /g')"
         if have sudo; then
-            sudo bash "$SELF" __root "$(id -un)" "${PAYLOAD:-/nonexistent}" "$nj8" "$nj17" "$ncab" || warn "system-level setup reported a problem - continuing"
+            sudo bash "$SELF" __root "$(id -un)" "${PAYLOAD:-/nonexistent}" "$nj8" "$nj17" "$ncab" "$epass" || warn "system-level setup reported a problem - continuing"
         else
             warn "sudo is not installed. Run this as root, then run install again:"
-            info "su -c 'bash $SELF __root $(id -un) ${PAYLOAD:-/nonexistent} $nj8 $nj17 $ncab'"
+            info "su -c 'bash $SELF __root $(id -un) ${PAYLOAD:-/nonexistent} $nj8 $nj17 $ncab $epass'"
             [ -z "$PAYLOAD_TMP" ] || { PAYLOAD_TMP=""; info "(payload kept in $PAYLOAD for that command)"; }
             exit 1
         fi
@@ -1402,8 +1458,28 @@ cmd_doctor() {
     svc_wanted eoffice7 || { o=$(port_owner $E7_PORT); [ -n "$o" ] && d_warn "an eOffice 7.x signer runs on $E7_PORT ($o) although only $EOFFICE_VER is chosen"; }
 
     d_head "Token"
-    local tk; tk=$(tokens_plugged)
-    if [ -n "$tk" ]; then d_ok "USB token(s): $(echo "$tk" | cut -d: -f2 | paste -sd, -)"
+    local tk t v nm drv l; tk=$(tokens_plugged)
+    if [ -n "$tk" ]; then
+        for t in $tk; do
+            v="${t%%:*}"; nm="${t#*:}"; drv=""
+            for l in $(p11_for_vid "$v"); do [ -f "$l" ] && { drv="$l"; break; }; done
+            if [ -n "$drv" ]; then d_ok "$nm token -> driver $drv"
+                case " $OPENSC_LIBS " in *" $drv "*)
+                    if have systemctl && systemctl is-active --quiet pcscd.socket 2>/dev/null || pgrep -x pcscd >/dev/null 2>&1; then d_ok "  (via OpenSC; smart-card service running)"
+                    else d_fail "  OpenSC needs the smart-card service"; d_fix "sudo systemctl enable --now pcscd.socket"; fi;; esac
+            else d_fail "$nm token plugged in, but its Linux driver is not installed"
+                case "$v" in
+                    096e) d_fix "railway-dsc install   (adds OpenSC, which supports the ePass2003)"
+                          d_fix "or Feitian's own driver: railway-dsc install --epass-zip=ePass2003-Linux-x64.zip";;
+                    163c) d_fix "install WatchData's ProxKey Linux driver (support.cryptoplanet.in -> Downloads -> Ubuntu)"
+                          d_fix "note: that installer adds a login hook and a world-writable folder; untested with this suite";;
+                    0529) d_fix "install SafeNet Authentication Client for Linux (from your token supplier)";;
+                    08e6) d_fix "install Thales/Gemalto IDPrime middleware, or: sudo apt install opensc-pkcs11 pcscd";;
+                    *)    d_fix "install the token vendor's Linux PKCS#11 driver, then set P11_LIB in $CONF_FILE";;
+                esac
+            fi
+        done
+        [ -n "${P11_LIB:-}" ] && d_ok "P11_LIB is set in suite.conf: $P11_LIB (overrides automatic choice)"
     else d_warn "no known DSC token on USB"; d_fix "plug the token in (try another port); 'lsusb' should list it"; fi
     if j=$(find_p11_lib); then
         d_ok "PKCS#11 driver: $j"
@@ -1499,6 +1575,8 @@ Railway DSC Signer Suite $SUITE_VERSION  -  eOffice (NIC $EOFFICE_VER and/or $E7
                        --msi=FILE     the official "Digital Signer Service 4.1.8_x64.msi"
                                       (default: searched in ~/Downloads, ~/Desktop)
                        --zip7=FILE    NIC's "DigitalSignerService_7.0.6_Ubuntu_Installer.zip"
+                       --epass-zip=FILE  Feitian's "ePass2003-Linux-x64.zip": installs its driver
+                                      (otherwise ePass2003 tokens use OpenSC, installed automatically)
                        --cris-msi=FILE, --ireps-msi=FILE   the vendors' Windows installers
                                       (default: searched in ~/Downloads); CRIS/IREPS are
                                       built from them with the Linux patch kit (kit/)
