@@ -14,6 +14,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 
 from pyhanko.pdf_utils.incremental_writer import IncrementalPdfFileWriter
 from pyhanko.sign import fields, signers
@@ -81,6 +82,12 @@ def ask_pin():
     return getpass.getpass("Token PIN: ")
 
 
+def current_umask():
+    m = os.umask(0)
+    os.umask(m)
+    return m
+
+
 def is_ca(cert):
     bc = cert.basic_constraints_value
     return bool(bc and bc["ca"].native)
@@ -133,10 +140,12 @@ def sign_file(a, src, out, signer):
 
         meta = signers.PdfSignatureMetadata(field_name=field, reason=a.reason, location=a.location,
                                             md_algorithm="sha256", subfilter=fields.SigSeedSubFilter.PADES)
-        tmp = out + ".part"
+        # a new, unpredictable temp file beside the output (O_EXCL: never follows a planted link), then renamed
+        fd, tmp = tempfile.mkstemp(prefix=".sign-pdf-", suffix=".part", dir=os.path.dirname(out) or ".")
         try:
-            with open(tmp, "wb") as o:
+            with os.fdopen(fd, "wb") as o:
                 signers.PdfSigner(meta, signer, stamp_style=style, new_field_spec=spec).sign_pdf(w, output=o)
+            os.chmod(tmp, 0o644 & ~current_umask())
         except BaseException:
             if os.path.exists(tmp):
                 os.remove(tmp)

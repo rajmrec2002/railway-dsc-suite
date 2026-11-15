@@ -136,7 +136,7 @@ What the install changes for this:
 |---|---|
 | The token's PKCS#11 driver is registered in `~/.pki/nssdb` | Document Viewer finds certificates through NSS |
 | **CCA India 2022** is trusted in `~/.pki/nssdb` for signatures only (`,C,`; fingerprint pinned) | so DSC signatures show as signed by a trusted issuer |
-| A few lines in `/etc/apparmor.d/local/usr.bin.papers` (and `usr.bin.evince`) let the viewer read the USB device tree | Ubuntu's AppArmor profile blocks it; the mToken driver then fails to start libusb and **crashes Document Viewer whenever a signed PDF is opened** |
+| A few lines in `/etc/apparmor.d/local/usr.bin.papers` (and `usr.bin.evince`) let the viewer read the USB device list and open USB device files | Ubuntu's AppArmor profile blocks it; the mToken driver then fails to start libusb and **crashes Document Viewer whenever a signed PDF is opened**. Only AppArmor's extra limit is lifted: normal file permissions still decide which USB devices the viewer can open (the suite's udev rule grants the token). Leave it out with `--no-pdf` |
 | `~/.local/share/dsc-pdfsign` (pyHanko in a Python venv), `~/.local/bin/sign-pdf`, an app entry and a Files script | `sign-pdf` |
 
 A `.run` bundle carries pyHanko as wheels for the packing machine's Python, so the install
