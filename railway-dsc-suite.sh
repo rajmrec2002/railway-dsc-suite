@@ -1,59 +1,76 @@
 #!/usr/bin/env bash
 # ==============================================================================
-#  Railway DSC Signer Suite - portable installer + self-healing supervisor
+#  Railway DSC Signer Suite 4 - install, repair and keep alive the three
+#  Indian Railways digital-signature (DSC) signer services on Linux.
 #
-#  Installs and keeps alive the three Indian Railways signer services:
-#    eOffice  NIC Digital Signer Service 7.0.6  https://127.0.0.1:55103
-#             + v4.1 compatibility bridge       https://127.0.0.1:55101
-#    CRIS     CrisSigner                        wss://127.0.0.1:2039
-#    IREPS    IREPSSigner                       wss://127.0.0.1:2175
+#    eOffice  NIC DSC Signer Service 4.1.8   https://eoffsigner.eoffice.gov.in:55101
+#    CRIS     CrisSigner                     wss://127.0.0.1:2039
+#    IREPS    IREPSSigner                    wss://127.0.0.1:2175
 #
-#  Workflow
-#    1. On a machine where everything already works:   ./railway-dsc-suite.sh pack
-#       -> produces ONE file, railway-dsc-suite-<date>.run (script + payload).
-#    2. Copy that file to any Linux PC and run:        bash railway-dsc-suite-<date>.run install
-#       Run it as the normal desktop user. It asks for sudo only for the few
-#       system-level steps (packages, /usr/local, token driver, udev, /etc/hosts).
+#  Written for Ubuntu (tested on 26.04); works on Debian/Mint/Pop, Fedora/RHEL,
+#  openSUSE, Arch, Alpine and Void with the same commands.
 #
-#  Self-healing (installed automatically)
-#    - every service restarts itself if it exits or is killed (Restart=always)
-#    - a watchdog runs every 3 minutes: probes each port for a real answer,
-#      restarts hung services, restores damaged or missing program files from a
-#      kept copy, removes duplicate signer instances, rewrites missing units,
-#      rotates oversized logs
-#    - without systemd, a small supervisor started from desktop autostart does
-#      the same job
+#  Where the program files come from (first match wins, per component)
+#    1. a payload attached to this script      (railway-dsc-suite-<date>.run, see "pack")
+#    2. the official Windows installer of the eOffice signer
+#       ("Digital Signer Service 4.1.8_x64.msi" - pass --msi=FILE or keep it in ~/Downloads);
+#       the jar inside it is plain Java and runs unchanged on Linux
+#    3. what is already installed on this machine (install = repair)
 #
-#  Commands: install | pack | status | heal | restart | stop | start | logs |
-#            trust | uninstall | help
+#  Why 4.1.8 and not 7.x for eOffice: eOffice portals still configured for signer
+#  "4.1" (port 55101, /signing/textSigning ...) reject 7.x; 4.1.8 speaks that protocol.
+#  The Linux-specific fixes this script applies (all without modifying NIC's jar):
+#    - Java 8 runtime (4.1.8 uses the Java-8-only SunPKCS11(String) API)
+#    - "pkcs11cfg" in the working directory pointing at the token's PKCS#11 driver
+#    - NIC's renewed HTTPS certificate (the one inside 4.1.8 expired 21-06-2026)
+#    - -Djavax.accessibility.assistive_technologies= (Ubuntu's Java 8 otherwise
+#      crashes every Swing window, including NIC's PIN prompt)
+#    - /etc/hosts: eoffsigner.eoffice.gov.in -> loopback (the signer rejects any
+#      other Host header with 401 "Invalid Request.")
+#
+#  Commands: install|repair | doctor | status | heal | start|stop|restart | logs |
+#            trust | pack | uninstall | help
 # ==============================================================================
 set -u
 set -o pipefail
 
-SUITE_VERSION="3.0.0"
+SUITE_VERSION="4.0.0"
 MARKER="__PAYLOAD_BELOW__"
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
 
 # ------------------------------------------------------------------ layout ---
-EOFFICE_DIR="/usr/local/DigitalSignerService-7.0.6"
-EOFFICE_JAR="$EOFFICE_DIR/DigitalSignerService-7.0.6.jar"
-JRE_JAVA="$EOFFICE_DIR/jre/bin/java"
 HOSTS_NAME="eoffsigner.eoffice.gov.in"
-HOSTS_ADDR="127.0.5.1"
+HOSTS_ADDR="127.0.5.1"                 # used only when /etc/hosts has no entry yet
+EOFFICE_VER="4.1.8"
+EOFFICE_JAR_NAME="DigitalSignerService4.1.8.jar"
+EOFFICE_JAR_SHA="a20f56ac01ff2ea5c548c94f05eb5e11900e9f34d31de2a999337e613251a300"
+EOFFICE_PORT=55101
+# SHA-256 of NIC's private "eOfficeCA2022" root (same in the 4.1.8 MSI's Pre-Requisites/eOfficeCA2022.cer
+# and in every 7.0.x package). Only a keystore whose chain ends in exactly this CA is accepted,
+# because that CA gets added to the browsers' trust stores.
+EOFFICE_CA_SHA256="28:D3:F3:52:E1:76:05:16:5C:BD:C2:75:EB:4C:63:B2:55:FF:63:88:AC:5A:A2:CE:1A:84:A0:97:D4:A3:E1:40"
+LEGACY_706_DIR="/usr/local/DigitalSignerService-7.0.6"
 VENDOR_HOOK="/etc/profile.d/DSC706-start.sh"
 MTOKEN_LIB="/usr/lib/libcryptoid_pkcs11.so"
-UDEV_RULE="/etc/udev/rules.d/90-mtoken.rules"
+UDEV_RULE="/etc/udev/rules.d/90-dsc-tokens.rules"
+LEGACY_UNITS="eofficesigner eofficesigner-proxy"     # 7.0.6 signer and the old v4 bridge
 
 set_user_paths() {            # $1 = home directory
     U_HOME="$1"
-    EOFFICE_WORK="$U_HOME/DigitalSignerService-7.0.6"
-    EOFFICE_LOGS="$U_HOME/DigitalSignerService-7.0.6-Logs"
+    EOFFICE_DIR="$U_HOME/DigitalSignerService-$EOFFICE_VER"
+    EOFFICE_JAR="$EOFFICE_DIR/$EOFFICE_JAR_NAME"
+    EOFFICE_JKS="$EOFFICE_DIR/dscSSL.jks"
+    EOFFICE_P11CFG="$EOFFICE_DIR/pkcs11cfg"
+    EOFFICE_CA="$EOFFICE_DIR/eOfficeCA2022.pem"
+    EOFFICE_LOGS="$EOFFICE_DIR/logs"
+    EOFFICE_APPLOGS="$U_HOME/DscSignerAppLogs"     # written by the signer itself
     CRIS_DIR="$U_HOME/CrisSigner_Linux"
     IREPS_DIR="$U_HOME/IREPSSigner_Linux"
-    PROXY_DIR="$U_HOME/.config/eoffice-proxy"
     CONF_DIR="$U_HOME/.config/railway-dsc"
     CONF_FILE="$CONF_DIR/suite.conf"
     SHARE_DIR="$U_HOME/.local/share/railway-dsc"
+    JRE8_DIR="$SHARE_DIR/jre8"
+    JRE17_DIR="$SHARE_DIR/jre17"
     KEEP_DIR="$SHARE_DIR/keep"
     STATE_DIR="$SHARE_DIR/state"
     MANIFEST="$SHARE_DIR/manifest.sha256"
@@ -66,12 +83,21 @@ set_user_paths() {            # $1 = home directory
 }
 set_user_paths "$HOME"
 
-# service table: name | systemd unit | probe kind | port
-SVCS="eoffice proxy cris ireps"
-svc_unit()  { case "$1" in eoffice) echo eofficesigner;; proxy) echo eofficesigner-proxy;; cris) echo crissigner;; ireps) echo irepssigner;; esac; }
-svc_kind()  { case "$1" in eoffice|proxy) echo http;; *) echo ws;; esac; }
-svc_port()  { case "$1" in eoffice) echo 55103;; proxy) echo 55101;; cris) echo 2039;; ireps) echo 2175;; esac; }
-svc_label() { case "$1" in eoffice) echo "eOffice signer (NIC 7.0.6)";; proxy) echo "eOffice v4.1 bridge";; cris) echo "CrisSigner";; ireps) echo "IREPSSigner";; esac; }
+# service table
+ALL_SVCS="eoffice cris ireps"
+svc_unit()  { case "$1" in eoffice) echo eofficesigner418;; cris) echo crissigner;; ireps) echo irepssigner;; esac; }
+svc_kind()  { case "$1" in eoffice) echo http;; *) echo ws;; esac; }
+svc_port()  { case "$1" in eoffice) echo $EOFFICE_PORT;; cris) echo 2039;; ireps) echo 2175;; esac; }
+svc_label() { case "$1" in eoffice) echo "eOffice signer (NIC $EOFFICE_VER)";; cris) echo "CrisSigner";; ireps) echo "IREPSSigner";; esac; }
+svc_files_ok() {
+    case "$1" in
+        eoffice) [ -f "$EOFFICE_JAR" ] && [ -f "$EOFFICE_JKS" ];;
+        cris)    [ -f "$CRIS_DIR/crissigner_app.jar" ];;
+        ireps)   [ -f "$IREPS_DIR/irepssigner_app.jar" ];;
+    esac
+}
+present_svcs() { local s o=""; for s in $ALL_SVCS; do svc_files_ok "$s" && o="$o $s"; done; echo "${o# }"; }
+SVCS="$(present_svcs)"
 
 # ----------------------------------------------------------------- helpers ---
 if [ -t 1 ]; then G=$'\033[0;32m'; R=$'\033[0;31m'; Y=$'\033[1;33m'; B=$'\033[1m'; N=$'\033[0m'; else G=""; R=""; Y=""; B=""; N=""; fi
@@ -83,28 +109,112 @@ step() { echo; echo "${B}==> $*${N}"; }
 die()  { fail "$*"; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 hlog() { mkdir -p "$SHARE_DIR"; echo "$(date '+%F %T') $*" >> "$HEAL_LOG"; }
+sha()  { sha256sum "$1" 2>/dev/null | cut -d' ' -f1; }
+have_systemd_user() { [ "${RDSC_NO_SYSTEMD:-}" != 1 ] && have systemctl && systemctl --user show-environment >/dev/null 2>&1; }
 
-have_systemd_user() { have systemctl && systemctl --user show-environment >/dev/null 2>&1; }
-sha() { sha256sum "$1" 2>/dev/null | cut -d' ' -f1; }
+hook_active() { [ -f "$VENDOR_HOOK" ] && grep -Eq '^[^#]*DigitalSignerService' "$VENDOR_HOOK" 2>/dev/null; }
+hosts_addr()  { getent hosts "$HOSTS_NAME" 2>/dev/null | awk '{print $1; exit}'; }
+hosts_ok()    { case "$(hosts_addr)" in 127.*) return 0;; *) return 1;; esac; }
 
-hook_active() { [ -f "$VENDOR_HOOK" ] && grep -q 'DigitalSignerService-7.0.6.jar' "$VENDOR_HOOK" 2>/dev/null; }
-token_present() { grep -qsi '^055c$' /sys/bus/usb/devices/*/idVendor 2>/dev/null; }
-bundled_java_ok() { [ -x "$1" ] && "$1" -version >/dev/null 2>&1; }
+# USB vendor IDs of common Indian DSC tokens
+TOKEN_VIDS="055c:Longmai-mToken 096e:Feitian-ePass2003 163c:WatchData-ProxKey/TrustKey 0529:SafeNet-eToken 08e6:Gemalto 24dc:Aladdin-JaCarta 1a44:VASCO 04e6:SCM-reader 072f:ACS-reader"
+tokens_plugged() {            # prints "vid:Name" for each plugged token
+    local f vid t
+    for f in /sys/bus/usb/devices/*/idVendor; do
+        [ -f "$f" ] || continue; vid=$(cat "$f" 2>/dev/null)
+        for t in $TOKEN_VIDS; do [ "${t%%:*}" = "$vid" ] && echo "$t"; done
+    done | sort -u
+}
 
+P11_CANDIDATES="/usr/lib/libcryptoid_pkcs11.so /usr/lib/libcastle.so.1.0.0 /usr/lib/libcastle.so
+ /usr/lib/x86_64-linux-gnu/libcastle.so /usr/lib64/libcastle.so
+ /usr/lib/WatchData/ProxKey/lib/libwdpkcs_SignatureP11.so /usr/lib/WatchData/TRUSTKEY/lib/libwdpkcs_TRUSTKEY.so
+ /usr/lib/WatchData/eMudhra_3.4.3/lib/libwdpkcs_eMudhra_343.so /usr/lib/WatchData/PROXKey/lib/libwdpkcs.so
+ /usr/lib/libwdpkcs.so /usr/lib/libmTokenPKCS11.so /usr/lib/libaetpkss.so.2.3.1 /usr/lib/libaetpkss.so
+ /usr/lib/libeTPkcs11.so /usr/lib/libeToken.so /usr/lib/pkcs11/libgtop11dotnet.so /usr/lib/libgtop11dotnet.so
+ /usr/lib/x86_64-linux-gnu/opensc-pkcs11.so /usr/lib64/opensc-pkcs11.so /usr/lib64/pkcs11/opensc-pkcs11.so
+ /usr/lib/opensc-pkcs11.so /usr/lib/pkcs11/opensc-pkcs11.so"
 find_p11_lib() {
     local l
-    for l in "${P11_LIB:-}" "$MTOKEN_LIB" /usr/lib/libcastle.so.1.0.0 /usr/lib/libcastle.so \
-             /usr/lib/x86_64-linux-gnu/libcastle.so /usr/lib64/libcastle.so \
-             /usr/lib/WatchData/eMudhra_3.4.3/lib/libwdpkcs_eMudhra_343.so \
-             /usr/lib/WatchData/TRUSTKEY/lib/libwdpkcs_TRUSTKEY.so \
-             /usr/lib/WatchData/ProxKey/lib/libwdpkcs_SignatureP11.so \
-             /usr/lib/WatchData/PROXKey/lib/libwdpkcs.so /usr/lib/libwdpkcs.so \
-             /usr/lib/libmTokenPKCS11.so /usr/lib/libaetpkss.so.2.3.1 /usr/lib/libeTPkcs11.so \
-             /usr/lib/x86_64-linux-gnu/opensc-pkcs11.so /usr/lib64/opensc-pkcs11.so \
-             /usr/lib64/pkcs11/opensc-pkcs11.so /usr/lib/opensc-pkcs11.so /usr/lib/pkcs11/opensc-pkcs11.so; do
-        [ -n "$l" ] && [ -f "$l" ] && { echo "$l"; return 0; }
+    for l in ${P11_LIB:-} $P11_CANDIDATES; do [ -f "$l" ] && { echo "$l"; return 0; }; done
+    return 1
+}
+
+# ------------------------------------------------------------------- java ---
+java_major() { "$1" -version 2>&1 | awk -F'"' '/version/{split($2,v,"."); print (v[1]=="1")?v[2]:v[1]; exit}'; }
+java_has_gui() { local r; r="$(dirname "$(dirname "$(readlink -f "$1")")")"; [ -n "$(find "$r" -name 'libawt_xawt.so' -print -quit 2>/dev/null)" ]; }
+find_java8() {                # a Java 8 runtime WITH the GUI libraries (the PIN prompt is Swing)
+    local j
+    for j in ${JAVA8:-} "$JRE8_DIR/bin/java" /usr/lib/jvm/java-8-openjdk-*/jre/bin/java \
+             /usr/lib/jvm/java-1.8.0-openjdk*/jre/bin/java /usr/lib/jvm/jre-1.8.0*/bin/java \
+             /usr/lib/jvm/java-8-*/jre/bin/java /usr/lib/jvm/temurin-8-*/bin/java /usr/lib/jvm/zulu8*/jre/bin/java \
+             /usr/java/jre1.8*/bin/java /usr/java/jdk1.8*/jre/bin/java /opt/jre1.8*/bin/java "$U_HOME"/java/jre1.8*/bin/java; do
+        [ -x "$j" ] || continue
+        [ "$(java_major "$j" 2>/dev/null)" = 8 ] && java_has_gui "$j" && { echo "$j"; return 0; }
     done
     return 1
+}
+find_java_modern() {          # Java 11+ for CrisSigner/IREPSSigner (17 preferred)
+    local j m
+    for j in ${JAVA17:-} "$JRE17_DIR/bin/java" "$LEGACY_706_DIR/jre/bin/java" /usr/lib/jvm/java-17*/bin/java \
+             /usr/lib/jvm/jre-17*/bin/java /usr/lib/jvm/temurin-17*/bin/java /usr/lib/jvm/java-21*/bin/java \
+             /usr/lib/jvm/java-1[1-9]*/bin/java /usr/lib/jvm/java-2[0-9]*/bin/java "$(command -v java 2>/dev/null)"; do
+        [ -n "$j" ] && [ -x "$j" ] || continue
+        m=$(java_major "$j" 2>/dev/null); [ -n "$m" ] && [ "$m" -ge 11 ] 2>/dev/null && java_has_gui "$j" && { echo "$j"; return 0; }
+    done
+    return 1
+}
+keytool_bin() {
+    local j d
+    for j in "$(find_java8 2>/dev/null)" "$(find_java_modern 2>/dev/null)"; do
+        [ -n "$j" ] || continue; d=$(dirname "$(readlink -f "$j")"); [ -x "$d/keytool" ] && { echo "$d/keytool"; return 0; }
+    done
+    have keytool && { command -v keytool; return 0; }
+    return 1
+}
+jks_expiry() {                # $1 = jks (alias 1, password eoffice) -> epoch of notAfter
+    local kt end; kt=$(keytool_bin) || return 1
+    end=$("$kt" -list -v -keystore "$1" -storepass eoffice -alias 1 2>/dev/null | sed -n 's/.*until: //p' | head -1)
+    [ -n "$end" ] && date -d "$end" +%s 2>/dev/null
+}
+jks_valid() { local e; e=$(jks_expiry "$1") && [ -n "$e" ] && [ "$e" -gt "$(date +%s)" ]; }
+jks_leaf_pem() {              # $1 = jks -> first certificate (the server's own) of alias 1 as PEM
+    local kt; kt=$(keytool_bin) || return 1
+    "$kt" -list -rfc -keystore "$1" -storepass eoffice -alias 1 2>/dev/null |
+        awk '/BEGIN CERTIFICATE/{on=1} on{print} /END CERTIFICATE/{exit}'
+}
+jks_trusted() {               # $1 = jks: chain ends in the pinned NIC CA and the leaf is for $HOSTS_NAME
+    have openssl || return 1
+    local d; d="$(work_tmp)/verify.$$"; mkdir -p "$d"
+    jks_ca_pem "$1" > "$d/ca.pem" && jks_leaf_pem "$1" > "$d/leaf.pem" || { rm -rf "$d"; return 1; }
+    local fp; fp=$(openssl x509 -in "$d/ca.pem" -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2)
+    if [ "$fp" = "$EOFFICE_CA_SHA256" ] &&
+       openssl verify -CAfile "$d/ca.pem" "$d/leaf.pem" >/dev/null 2>&1 &&
+       openssl x509 -in "$d/leaf.pem" -noout -ext subjectAltName 2>/dev/null | grep -q "DNS:$HOSTS_NAME"; then
+        rm -rf "$d"; return 0
+    fi
+    rm -rf "$d"; return 1
+}
+jks_ca_pem() {                # $1 = jks -> prints the last (CA) certificate of alias 1's chain as PEM
+    local kt; kt=$(keytool_bin) || return 1
+    "$kt" -list -rfc -keystore "$1" -storepass eoffice -alias 1 2>/dev/null |
+        awk '/BEGIN CERTIFICATE/{buf=""; on=1} on{buf=buf $0 "\n"} /END CERTIFICATE/{on=0; last=buf} END{printf "%s", last}'
+}
+
+# Download a Temurin JRE (used only when neither a package nor the payload provides one)
+fetch_temurin() {             # $1 = 8|17   $2 = destination dir
+    local ver="$1" dst="$2" arch tmp json link sum
+    case "$(uname -m)" in x86_64) arch=x64;; aarch64) arch=aarch64;; armv7l) arch=arm;; *) return 1;; esac
+    have curl && have python3 || return 1
+    tmp=$(mktemp -d) || return 1
+    json=$(curl -fsSL --max-time 60 "https://api.adoptium.net/v3/assets/latest/$ver/hotspot?architecture=$arch&image_type=jre&os=linux&vendor=eclipse") || { rm -rf "$tmp"; return 1; }
+    read -r link sum < <(printf '%s' "$json" | python3 -c 'import json,sys; a=json.load(sys.stdin)[0]["binary"]["package"]; print(a["link"], a["checksum"])') || { rm -rf "$tmp"; return 1; }
+    info "Downloading Temurin $ver JRE ..."
+    curl -fsSL --max-time 900 -o "$tmp/jre.tgz" "$link" || { rm -rf "$tmp"; return 1; }
+    [ "$(sha "$tmp/jre.tgz")" = "$sum" ] || { warn "Temurin download failed its checksum"; rm -rf "$tmp"; return 1; }
+    mkdir -p "$tmp/x" && tar -xzf "$tmp/jre.tgz" -C "$tmp/x" --strip-components=1 || { rm -rf "$tmp"; return 1; }
+    rm -rf "$dst"; mkdir -p "$(dirname "$dst")"; mv "$tmp/x" "$dst"; rm -rf "$tmp"
+    [ -x "$dst/bin/java" ]
 }
 
 # ------------------------------------------------------- service back-ends ---
@@ -125,7 +235,13 @@ svc_stop() {
     else local p; p=$(cat "$STATE_DIR/pid.$1" 2>/dev/null); [ -n "$p" ] && kill "$p" 2>/dev/null; rm -f "$STATE_DIR/pid.$1"; fi
 }
 svc_age() { local p; p=$(svc_pid "$1"); [ -n "$p" ] && [ "$p" != 0 ] && ps -o etimes= -p "$p" 2>/dev/null | tr -d ' ' || echo 0; }
-probe()   { python3 "$PROBE" "$(svc_kind "$1")" "$(svc_port "$1")" >/dev/null 2>&1; }
+ensure_probe() { [ -f "$PROBE" ] || { PROBE="$(work_tmp)/probe.py"; [ -f "$PROBE" ] || write_probe; }; }
+probe() {
+    ensure_probe
+    if [ "$1" = eoffice ]; then python3 "$PROBE" http "$EOFFICE_PORT" "$(hosts_addr || true)" "$HOSTS_NAME" >/dev/null 2>&1
+    else python3 "$PROBE" ws "$(svc_port "$1")" >/dev/null 2>&1; fi
+}
+port_owner() { ss -ltnpH "sport = :$1" 2>/dev/null | sed -n 's/.*users:((\("[^"]*",pid=[0-9]*\).*/\1/p' | head -1; }
 
 ensure_supervisor() {         # non-systemd systems only
     have_systemd_user && return 0
@@ -138,19 +254,20 @@ ensure_supervisor() {         # non-systemd systems only
 
 # ============================================================== generators ===
 write_probe() {
+    mkdir -p "$(dirname "$PROBE")"
     cat > "$PROBE" <<'PY'
 #!/usr/bin/env python3
 """Functional health probe: exit 0 only if the signer really answers.
-usage: probe.py http|ws PORT"""
+usage: probe.py http PORT [ADDR] [HOSTNAME]   |   probe.py ws PORT"""
 import base64, os, socket, ssl, sys
 
-def tls(port):
+def tls(addr, port, sni):
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
-    raw = socket.create_connection(("127.0.0.1", port), timeout=8)
+    raw = socket.create_connection((addr, port), timeout=8)
     raw.settimeout(8)
-    return ctx.wrap_socket(raw, server_hostname="127.0.0.1")
+    return ctx.wrap_socket(raw, server_hostname=sni)
 
 def read_until(sock, token, limit=65536):
     data = b""
@@ -161,18 +278,19 @@ def read_until(sock, token, limit=65536):
         data += chunk
     return data
 
-def http(port):
-    s = tls(port)
+def http(port, addr, host):
+    # The NIC signer answers 401 to any Host header other than its own name.
+    s = tls(addr, port, host)
     try:
-        s.sendall(b"GET /check/isLive HTTP/1.0\r\nHost: 127.0.0.1\r\n"
-                  b"Origin: https://localhost\r\nConnection: close\r\n\r\n")
+        s.sendall(b"GET /check/isLive HTTP/1.0\r\nHost: %s:%d\r\n"
+                  b"Origin: https://localhost\r\nConnection: close\r\n\r\n" % (host.encode(), port))
         data = read_until(s, b"version")
         return b" 200" in data.split(b"\r\n", 1)[0] and b"success" in data
     finally:
         s.close()
 
 def ws(port):
-    s = tls(port)
+    s = tls("127.0.0.1", port, "127.0.0.1")
     try:
         key = base64.b64encode(os.urandom(16))
         s.sendall(b"GET / HTTP/1.1\r\nHost: 127.0.0.1:%d\r\nUpgrade: websocket\r\n"
@@ -196,7 +314,13 @@ def ws(port):
 if __name__ == "__main__":
     try:
         kind, port = sys.argv[1], int(sys.argv[2])
-        sys.exit(0 if (http(port) if kind == "http" else ws(port)) else 1)
+        if kind == "http":
+            addr = sys.argv[3] if len(sys.argv) > 3 and sys.argv[3] else "127.0.0.1"
+            host = sys.argv[4] if len(sys.argv) > 4 else "eoffsigner.eoffice.gov.in"
+            good = http(port, addr, host)
+        else:
+            good = ws(port)
+        sys.exit(0 if good else 1)
     except Exception as exc:
         sys.stderr.write("probe failed: %s\n" % exc)
         sys.exit(1)
@@ -205,38 +329,22 @@ PY
 }
 
 write_launcher() {
-    cat > "$LAUNCH" <<LAUNCH_EOF
-#!/usr/bin/env bash
-# Generated by railway-dsc-suite $SUITE_VERSION - do not edit; re-run "railway-dsc install".
-# usage: launch.sh eoffice|proxy|cris|ireps
-EOFFICE_DIR="$EOFFICE_DIR"
-EOFFICE_JAR="$EOFFICE_JAR"
-EOFFICE_WORK="$EOFFICE_WORK"
-EOFFICE_LOGS="$EOFFICE_LOGS"
-CRIS_DIR="$CRIS_DIR"
-IREPS_DIR="$IREPS_DIR"
-PROXY_DIR="$PROXY_DIR"
-CONF_FILE="$CONF_FILE"
-LAUNCH_EOF
+    mkdir -p "$SHARE_DIR"
+    {
+        echo '#!/usr/bin/env bash'
+        echo "# Generated by railway-dsc-suite $SUITE_VERSION - do not edit; re-run \"railway-dsc install\"."
+        echo '# usage: launch.sh eoffice|cris|ireps'
+        local v
+        for v in U_HOME EOFFICE_DIR EOFFICE_JAR EOFFICE_JKS EOFFICE_LOGS CRIS_DIR IREPS_DIR CONF_FILE \
+                 JRE8_DIR JRE17_DIR LEGACY_706_DIR HOSTS_NAME P11_CANDIDATES; do
+            printf '%s=%q\n' "$v" "${!v}"
+        done
+        declare -f java_major java_has_gui find_java8 find_java_modern find_p11_lib
+    } > "$LAUNCH"
     cat >> "$LAUNCH" <<'LAUNCH_EOF'
 SVC="${1:-}"
-DSC_UI_SCALE=1; P11_LIB=""; DSC_PROXY_BIND="127.0.0.1,127.0.5.1"
+DSC_UI_SCALE=1; P11_LIB=""; JAVA8=""; JAVA17=""
 [ -f "$CONF_FILE" ] && . "$CONF_FILE"
-export DSC_PROXY_BIND
-
-if [ "$SVC" = proxy ]; then
-    exec python3 "$PROXY_DIR/eoffice_proxy.py"
-fi
-
-# --- Java: bundled JRE 17 if it runs here, otherwise a system Java -------------
-JAVA_BIN=""
-if [ -x "$EOFFICE_DIR/jre/bin/java" ] && "$EOFFICE_DIR/jre/bin/java" -version >/dev/null 2>&1; then
-    JAVA_BIN="$EOFFICE_DIR/jre/bin/java"
-elif command -v java >/dev/null 2>&1; then
-    JAVA_BIN="$(command -v java)"
-fi
-[ -n "$JAVA_BIN" ] || { echo "No usable Java runtime found."; exit 1; }
-JAVA_MAJOR=$("$JAVA_BIN" -version 2>&1 | awk -F'"' '/version/{split($2,v,"."); print (v[1]=="1")?v[2]:v[1]; exit}')
 
 # --- Display: these are Swing apps and the PIN prompt needs an X display -------
 if [ -z "${DISPLAY:-}" ] && command -v systemctl >/dev/null 2>&1; then
@@ -262,49 +370,37 @@ i=0
 while [ ! -S "/tmp/.X11-unix/X$dnum" ] && [ $i -lt 30 ]; do sleep 2; i=$((i+1)); done
 [ -S "/tmp/.X11-unix/X$dnum" ] || { echo "X display $DISPLAY not available - will retry."; exit 1; }
 
+# Ubuntu's Java ships an accessibility.properties naming the GNOME ATK bridge; when that
+# bridge is not installed every Swing window (incl. the PIN prompt) dies with AWTError.
+NOATK="-Djavax.accessibility.assistive_technologies="
 UI=("-Dsun.java2d.uiScale.enabled=true" "-Dsun.java2d.uiScale=${DSC_UI_SCALE}")
 
 if [ "$SVC" = eoffice ]; then
-    mkdir -p "$EOFFICE_WORK" "$EOFFICE_LOGS" 2>/dev/null
-    cd "$EOFFICE_WORK" || exit 1
-    if [ -w "$EOFFICE_LOGS" ] || [ -w "$EOFFICE_LOGS/output.log" ]; then
-        exec >>"$EOFFICE_LOGS/output.log" 2>>"$EOFFICE_LOGS/errorOutput.log"
-    fi
-    # java.awt.headless=true is harmless here: the application resets it to false itself.
-    exec "$JAVA_BIN" "${UI[@]}" -Djava.awt.headless=true \
-        -Dorg.jcp.xml.dsig.secureValidation=false -jar "$EOFFICE_JAR"
+    J8=$(find_java8) || { echo "No Java 8 runtime with GUI libraries found - run: railway-dsc install"; exit 1; }
+    BIND=$(getent hosts "$HOSTS_NAME" 2>/dev/null | awk '{print $1; exit}')
+    case "$BIND" in 127.*) ;; *) BIND=127.0.0.1;; esac      # never listen on the LAN
+    mkdir -p "$EOFFICE_LOGS"
+    cd "$EOFFICE_DIR" || exit 1                              # pkcs11cfg is read from here
+    exec >>"$EOFFICE_LOGS/output.log" 2>>"$EOFFICE_LOGS/error.log"
+    exec "$J8" "$NOATK" "${UI[@]}" -jar "$EOFFICE_JAR" \
+        --server.ssl.key-store="file:$EOFFICE_JKS" --server.address="$BIND"
 fi
 
 case "$SVC" in
     cris)  APP_DIR="$CRIS_DIR";  APP_JAR="crissigner_app.jar" ;;
     ireps) APP_DIR="$IREPS_DIR"; APP_JAR="irepssigner_app.jar" ;;
-    *) echo "usage: launch.sh eoffice|proxy|cris|ireps"; exit 2 ;;
+    *) echo "usage: launch.sh eoffice|cris|ireps"; exit 2 ;;
 esac
+JAVA_BIN=$(find_java_modern) || { echo "No Java 11+ runtime with GUI libraries found - run: railway-dsc install"; exit 1; }
 cd "$APP_DIR" || exit 1
-OPTS=("-Djavax.accessibility.assistive_technologies= " "-Djava.util.Arrays.useLegacyMergeSort=true" "${UI[@]}")
-if [ "${JAVA_MAJOR:-17}" -gt 8 ] 2>/dev/null; then
-    OPTS+=("--add-exports=jdk.crypto.cryptoki/sun.security.pkcs11=ALL-UNNAMED"
-           "--add-opens=jdk.crypto.cryptoki/sun.security.pkcs11=ALL-UNNAMED"
-           "--add-opens=java.base/java.lang=ALL-UNNAMED"
-           "--add-opens=java.desktop/javax.swing=ALL-UNNAMED"
-           "--add-opens=java.desktop/java.awt=ALL-UNNAMED"
-           "--add-opens=java.desktop/sun.awt=ALL-UNNAMED")
-fi
-if [ -z "$P11_LIB" ] || [ ! -f "$P11_LIB" ]; then
-    P11_LIB=""
-    for l in /usr/lib/libcryptoid_pkcs11.so /usr/lib/libcastle.so.1.0.0 /usr/lib/libcastle.so \
-             /usr/lib/x86_64-linux-gnu/libcastle.so /usr/lib64/libcastle.so \
-             /usr/lib/WatchData/eMudhra_3.4.3/lib/libwdpkcs_eMudhra_343.so \
-             /usr/lib/WatchData/TRUSTKEY/lib/libwdpkcs_TRUSTKEY.so \
-             /usr/lib/WatchData/ProxKey/lib/libwdpkcs_SignatureP11.so \
-             /usr/lib/WatchData/PROXKey/lib/libwdpkcs.so /usr/lib/libwdpkcs.so \
-             /usr/lib/libmTokenPKCS11.so /usr/lib/libaetpkss.so.2.3.1 /usr/lib/libeTPkcs11.so \
-             /usr/lib/x86_64-linux-gnu/opensc-pkcs11.so /usr/lib64/opensc-pkcs11.so \
-             /usr/lib64/pkcs11/opensc-pkcs11.so /usr/lib/opensc-pkcs11.so /usr/lib/pkcs11/opensc-pkcs11.so; do
-        [ -f "$l" ] && { P11_LIB="$l"; break; }
-    done
-fi
-[ -n "$P11_LIB" ] && OPTS+=("-Dwebsigner.pkcs11.library=$P11_LIB")
+OPTS=("$NOATK" "-Djava.util.Arrays.useLegacyMergeSort=true" "${UI[@]}"
+      "--add-exports=jdk.crypto.cryptoki/sun.security.pkcs11=ALL-UNNAMED"
+      "--add-opens=jdk.crypto.cryptoki/sun.security.pkcs11=ALL-UNNAMED"
+      "--add-opens=java.base/java.lang=ALL-UNNAMED"
+      "--add-opens=java.desktop/javax.swing=ALL-UNNAMED"
+      "--add-opens=java.desktop/java.awt=ALL-UNNAMED"
+      "--add-opens=java.desktop/sun.awt=ALL-UNNAMED")
+P11=$(find_p11_lib) && OPTS+=("-Dwebsigner.pkcs11.library=$P11")
 CP="$APP_DIR/lib/windows-laf-stub.jar:$APP_DIR/lib/windowslookandfell-stub.jar:$APP_DIR/$APP_JAR:$APP_DIR/lib/*"
 exec "$JAVA_BIN" "${OPTS[@]}" -cp "$CP" server.ServerUI
 LAUNCH_EOF
@@ -313,16 +409,14 @@ LAUNCH_EOF
 
 write_units() {
     mkdir -p "$UNIT_DIR"
-    local s u extra
+    local s u
     for s in $SVCS; do
-        u=$(svc_unit "$s"); extra=""
-        [ "$s" = proxy ] && extra=$'After=eofficesigner.service\nWants=eofficesigner.service'
-        [ "$s" = eoffice ] && extra=$'After=network.target'
+        u=$(svc_unit "$s")
         cat > "$UNIT_DIR/$u.service" <<UNIT_EOF
 # Generated by railway-dsc-suite $SUITE_VERSION
 [Unit]
 Description=$(svc_label "$s")
-$extra
+After=graphical-session.target
 StartLimitIntervalSec=0
 
 [Service]
@@ -359,6 +453,7 @@ AccuracySec=15
 WantedBy=timers.target
 UNIT_EOF
 }
+unit_names() { local s o=""; for s in $SVCS; do o="$o $(svc_unit "$s").service"; done; echo "$o railway-dsc-heal.timer"; }
 
 install_self() {              # copy this script WITHOUT the payload to ~/.local/bin
     mkdir -p "$(dirname "$BIN")"
@@ -367,11 +462,11 @@ install_self() {              # copy this script WITHOUT the payload to ~/.local
     chmod 755 "$BIN.tmp"; mv -f "$BIN.tmp" "$BIN"
 }
 
-# The files the watchdog can restore by itself: everything except the 300 MB JRE.
+# The files the watchdog can restore by itself (everything except the Java runtimes).
 keep_list() {
-    echo "$EOFFICE_JAR"
+    local f
+    for f in "$EOFFICE_JAR" "$EOFFICE_JKS" "$EOFFICE_P11CFG" "$EOFFICE_CA"; do echo "$f"; done
     find "$CRIS_DIR" "$IREPS_DIR" -maxdepth 2 -type f \( -name '*.jar' -o -name 'certificate.crt' \) 2>/dev/null
-    for f in eoffice_proxy.py fullchain.pem key.pem ca.pem; do echo "$PROXY_DIR/$f"; done
     echo "$LAUNCH"; echo "$PROBE"
 }
 refresh_keep() {
@@ -387,15 +482,18 @@ refresh_keep() {
 }
 
 # ================================================================== payload ===
-PAYLOAD=""; PAYLOAD_TMP=""
-cleanup() { [ -n "$PAYLOAD_TMP" ] && rm -rf "$PAYLOAD_TMP"; }
+PAYLOAD=""; PAYLOAD_TMP=""; WORK_TMP=""
+cleanup() { [ -n "$PAYLOAD_TMP" ] && rm -rf "$PAYLOAD_TMP"; [ -n "$WORK_TMP" ] && rm -rf "$WORK_TMP"; return 0; }
+trap cleanup EXIT
+init_work_tmp() { [ -n "$WORK_TMP" ] || { mkdir -p "$HOME/.cache"; WORK_TMP=$(mktemp -d "$HOME/.cache/railway-dsc-work.XXXXXX") || die "cannot create a temporary directory"; }; }
+work_tmp() { echo "$WORK_TMP"; }     # created once in main(), so subshells share it
+
 locate_payload() {
     local n; n=$(grep -a -n -m1 "^${MARKER}\$" "$SELF" | cut -d: -f1)
     if [ -n "$n" ]; then
         mkdir -p "$HOME/.cache"
         PAYLOAD_TMP=$(mktemp -d "$HOME/.cache/railway-dsc-payload.XXXXXX") || die "cannot create a temporary directory"
-        trap cleanup EXIT
-        info "Unpacking embedded payload (about 450 MB) ..."
+        info "Unpacking embedded payload ..."
         tail -n "+$((n+1))" "$SELF" | tar -xzf - -C "$PAYLOAD_TMP" || die "payload is damaged - copy the .run file again"
         PAYLOAD="$PAYLOAD_TMP"
     elif [ -d "$(dirname "$SELF")/payload" ]; then
@@ -406,62 +504,68 @@ locate_payload() {
     fi
 }
 
+# ----------------------------------------------------- eOffice file sources ---
+find_msi() {                  # the official Windows installer of the 4.1.8 signer
+    [ -n "${OPT_MSI:-}" ] && { [ -f "$OPT_MSI" ] && echo "$OPT_MSI"; return; }
+    find "$U_HOME/Downloads" "$U_HOME/Desktop" "$U_HOME" -maxdepth 5 -type f -iname '*signer*4.1.8*.msi' 2>/dev/null | head -1
+}
+jar_from_msi() {              # $1 = msi -> path of the verified jar (in a temp dir)
+    have cabextract || return 1
+    local t; t="$(work_tmp)/msi"; mkdir -p "$t"
+    cabextract -q -d "$t" -F "$EOFFICE_JAR_NAME" "$1" >/dev/null 2>&1 || return 1
+    [ "$(sha "$t/$EOFFICE_JAR_NAME")" = "$EOFFICE_JAR_SHA" ] || return 1
+    echo "$t/$EOFFICE_JAR_NAME"
+}
+renewed_jks_candidates() {    # NIC's renewed eoffsigner certificate ships in the 7.0.x packages
+    [ -n "$PAYLOAD" ] && echo "jks:$PAYLOAD/eoffice/dscSSL.jks"
+    echo "jks:$EOFFICE_JKS"
+    local f
+    for f in "$LEGACY_706_DIR"/DigitalSignerService-7.0.*.jar* ; do [ -f "$f" ] && echo "jar:$f"; done
+    find "$U_HOME/Downloads" "$U_HOME/Desktop" -maxdepth 5 -type f -name 'DigitalSignerService-7.0.*.jar' 2>/dev/null | sed 's/^/jar:/'
+    find "$U_HOME/Downloads" "$U_HOME/Desktop" -maxdepth 4 -type f -iname '*DigitalSignerService*7.0*Installer*.zip' 2>/dev/null | sed 's/^/zip:/'
+    [ -f "$EOFFICE_JAR" ] && echo "jar:$EOFFICE_JAR"        # 4.1.8's own (expired 2026) as a last resort
+}
+pick_valid_jks() {            # prints a path to a currently valid dscSSL.jks
+    local c kind f t i=0
+    while IFS= read -r c; do
+        kind="${c%%:*}"; f="${c#*:}"; [ -f "$f" ] || continue
+        i=$((i+1)); t="$(work_tmp)/jks$i"; mkdir -p "$t"
+        case "$kind" in
+            jks) cp -p "$f" "$t/dscSSL.jks" ;;
+            jar) unzip -p "$f" BOOT-INF/classes/dscSSL.jks > "$t/dscSSL.jks" 2>/dev/null ;;
+            zip) unzip -p "$f" '*/app/DigitalSignerService-7.0.*.jar' > "$t/in.jar" 2>/dev/null &&
+                 unzip -p "$t/in.jar" BOOT-INF/classes/dscSSL.jks > "$t/dscSSL.jks" 2>/dev/null ;;
+        esac
+        [ -s "$t/dscSSL.jks" ] || continue
+        if ! jks_trusted "$t/dscSSL.jks"; then
+            [ "$kind" = jks ] || warn "ignoring $f: its certificate is not issued by NIC's eOfficeCA2022 (fingerprint pinned)" >&2
+            continue
+        fi
+        jks_valid "$t/dscSSL.jks" && { echo "$t/dscSSL.jks"; return 0; }
+    done < <(renewed_jks_candidates)
+    return 1
+}
+
+# ================================================================= pack ======
 cmd_pack() {
     step "Packing this machine's working installation"
-    local out="${1:-$PWD/railway-dsc-suite-$(date +%Y%m%d).run}" st s bad=0
-    [ -f "$EOFFICE_JAR" ] && [ -d "$EOFFICE_DIR/jre" ] || die "eOffice signer not found in $EOFFICE_DIR"
-    [ -f "$CRIS_DIR/crissigner_app.jar" ]  || die "CrisSigner not found in $CRIS_DIR"
-    [ -f "$IREPS_DIR/irepssigner_app.jar" ] || die "IREPSSigner not found in $IREPS_DIR"
-    [ -f "$PROXY_DIR/eoffice_proxy.py" ] && [ -f "$PROXY_DIR/key.pem" ] || die "eOffice bridge not found in $PROXY_DIR"
-    if [ -x "$PROBE" ]; then
-        for s in $SVCS; do probe "$s" || { warn "$(svc_label "$s") is not answering right now - packing it anyway"; bad=1; }; done
-        [ $bad = 0 ] && ok "All four endpoints answer; packing a known-good state"
-    fi
-    mkdir -p "$HOME/.cache"; st=$(mktemp -d "$HOME/.cache/railway-dsc-pack.XXXXXX") || die "no temp dir"
-    # shellcheck disable=SC2064
-    trap "rm -rf '$st'" EXIT
-    mkdir -p "$st/eoffice" "$st/cris" "$st/ireps" "$st/proxy" "$st/drivers"
-    cp -a "$EOFFICE_DIR/jre" "$st/eoffice/"
-    cp -p "$EOFFICE_JAR" "$st/eoffice/"
-    [ -f "$EOFFICE_DIR/DSC48x48.png" ] && cp -p "$EOFFICE_DIR/DSC48x48.png" "$st/eoffice/"
-    local d
-    for d in cris ireps; do
-        local src="$CRIS_DIR"; [ $d = ireps ] && src="$IREPS_DIR"
-        cp -p "$src"/*.jar "$st/$d/"
-        cp -a "$src/lib" "$st/$d/"
-        for f in certificate.crt icon.png; do [ -f "$src/$f" ] && cp -p "$src/$f" "$st/$d/"; done
+    local out="${1:-$PWD/railway-dsc-suite-$(date +%Y%m%d).run}" st s j8 j17 r
+    svc_files_ok eoffice || die "eOffice signer not installed in $EOFFICE_DIR (run install first)"
+    [ -f "$CRIS_DIR/crissigner_app.jar" ]  || warn "CrisSigner not found in $CRIS_DIR - packing without it"
+    [ -f "$IREPS_DIR/irepssigner_app.jar" ] || warn "IREPSSigner not found in $IREPS_DIR - packing without it"
+    if [ -x "$PROBE" ]; then for s in $SVCS; do probe "$s" || warn "$(svc_label "$s") is not answering right now - packing it anyway"; done; fi
+    st="$(work_tmp)/pack"; mkdir -p "$st/eoffice" "$st/drivers"
+    cp -p "$EOFFICE_JAR" "$EOFFICE_JKS" "$st/eoffice/"
+    for s in cris ireps; do
+        local src="$CRIS_DIR"; [ $s = ireps ] && src="$IREPS_DIR"
+        [ -d "$src" ] || continue
+        mkdir -p "$st/$s"; cp -p "$src"/*.jar "$st/$s/"; cp -a "$src/lib" "$st/$s/"
+        for f in certificate.crt icon.png; do [ -f "$src/$f" ] && cp -p "$src/$f" "$st/$s/"; done
     done
-    for f in fullchain.pem key.pem ca.pem cert.pem; do [ -f "$PROXY_DIR/$f" ] && cp -p "$PROXY_DIR/$f" "$st/proxy/"; done
-    # Make the bridge location-independent and loopback-only (it used to listen on all interfaces).
-    python3 - "$PROXY_DIR/eoffice_proxy.py" "$st/proxy/eoffice_proxy.py" <<'PY' || die "could not prepare the bridge script"
-import re, sys
-src = open(sys.argv[1], encoding="utf-8").read()
-if "DSC_PROXY_BIND" not in src:
-    src, n1 = re.subn(r'^CONFIG_DIR = .*$', 'CONFIG_DIR = os.path.dirname(os.path.abspath(__file__))', src, count=1, flags=re.M)
-    new_tail = '''    import threading
-    binds = [b.strip() for b in os.environ.get("DSC_PROXY_BIND", "127.0.0.1,127.0.5.1").split(",") if b.strip()]
-    servers = []
-    for addr in binds:
-        try:
-            httpd = ThreadedHTTPServer((addr, port), DSCProxyHandler)
-        except OSError as exc:
-            sys.stderr.write(f"[eOffice-Bridge] cannot bind {addr}:{port}: {exc}\\n")
-            continue
-        httpd.socket = ssl_ctx.wrap_socket(httpd.socket, server_side=True)
-        servers.append(httpd)
-        print(f"eOffice DSC Bridge listening on https://{addr}:{port} -> {BACKEND_URL}", flush=True)
-    if not servers:
-        sys.exit(1)
-    for extra in servers[1:]:
-        threading.Thread(target=extra.serve_forever, daemon=True).start()
-    servers[0].serve_forever()
-'''
-    src, n2 = re.subn(r'^    server_address = \("0\.0\.0\.0", port\)\n.*?httpd\.serve_forever\(\)\n', lambda m: new_tail, src, count=1, flags=re.M | re.S)
-    if n1 != 1 or n2 != 1:
-        sys.exit("bridge script has an unexpected layout")
-compile(src, "eoffice_proxy.py", "exec")
-open(sys.argv[2], "w", encoding="utf-8").write(src)
-PY
+    if j8=$(find_java8); then r="$(dirname "$(dirname "$(readlink -f "$j8")")")"; cp -aL "$r" "$st/jre8" && ok "Java 8 runtime added ($r)"
+    else warn "no Java 8 to pack - the target will install one from its package manager"; fi
+    if j17=$(find_java_modern); then r="$(dirname "$(dirname "$(readlink -f "$j17")")")"; cp -aL "$r" "$st/jre17" && ok "Java $(java_major "$j17") runtime added for CRIS/IREPS ($r)"
+    else warn "no Java 11+ to pack"; fi
     [ -f "$MTOKEN_LIB" ] && cp -p "$MTOKEN_LIB" "$st/drivers/"
     ( cd "$st" && find . -type f ! -name MANIFEST.sha256 -print0 | sort -z | xargs -0 sha256sum > MANIFEST.sha256 )
     info "Compressing ..."
@@ -469,7 +573,7 @@ PY
     { if [ -n "$n" ]; then head -n "$((n-1))" "$SELF"; else cat "$SELF"; fi
       echo "$MARKER"
       tar -czf - -C "$st" . ; } > "$out.tmp" || die "packing failed"
-    chmod 700 "$out.tmp"; mv -f "$out.tmp" "$out"     # contains the bridge's TLS key: owner only
+    chmod 700 "$out.tmp"; mv -f "$out.tmp" "$out"     # contains vendor TLS keys: owner only
     ok "Created $out ($(du -h "$out" | cut -f1))"
     info "Copy it to the other PC and run:  bash $(basename "$out") install"
 }
@@ -485,7 +589,7 @@ pkg_install() {               # best effort, one package at a time
         elif have pacman;       then pacman -S --noconfirm --needed "$p" >/dev/null 2>&1
         elif have apk;          then apk add "$p" >/dev/null 2>&1
         elif have xbps-install; then xbps-install -y "$p" >/dev/null 2>&1
-        else return 1; fi && info "installed $p" || warn "could not install package '$p' - install it by hand if a later step complains"
+        else return 1; fi && info "installed $p" || warn "could not install package '$p'"
     done
 }
 pkgs_for() {                  # $1 = logical need -> distro package names
@@ -496,13 +600,18 @@ pkgs_for() {                  # $1 = logical need -> distro package names
         python:pacman) echo python;;                     python:*) echo python3;;
         certutil:apt) echo libnss3-tools;;               certutil:dnf|certutil:apk) echo nss-tools;;
         certutil:zypper) echo mozilla-nss-tools;;        certutil:*) echo nss;;
+        cabextract:*) echo cabextract;;
+        unzip:*) echo unzip;;
         xlibs:apt) echo "libxtst6 libxi6 libxrender1 libfreetype6 fontconfig";;
         xlibs:zypper) echo "libXtst6 libXi6 libXrender1 libfreetype6 fontconfig";;
         xlibs:pacman) echo "libxtst libxi libxrender freetype2 fontconfig";;
         xlibs:apk) echo "libxtst libxi libxrender freetype fontconfig ttf-dejavu";;
         xlibs:*) echo "libXtst libXi libXrender freetype fontconfig";;
-        java:apt) echo openjdk-17-jre;;                  java:dnf|java:zypper) echo java-17-openjdk;;
-        java:pacman) echo jre17-openjdk;;                java:apk|java:xbps) echo openjdk17-jre;;
+        java8:apt) echo openjdk-8-jre;;                  java8:dnf) echo java-1.8.0-openjdk;;
+        java8:zypper) echo java-1_8_0-openjdk;;          java8:pacman) echo jre8-openjdk;;
+        java8:apk|java8:xbps) echo openjdk8-jre;;
+        java17:apt) echo openjdk-17-jre;;                java17:dnf|java17:zypper) echo java-17-openjdk;;
+        java17:pacman) echo jre17-openjdk;;              java17:apk|java17:xbps) echo openjdk17-jre;;
         smartcard:apt) echo "pcscd libccid opensc";;     smartcard:dnf) echo "pcsc-lite pcsc-lite-ccid opensc";;
         smartcard:zypper) echo "pcsc-lite pcsc-ccid opensc";;
         smartcard:pacman|smartcard:xbps) echo "pcsclite ccid opensc";;
@@ -518,44 +627,47 @@ xlibs_missing() {
     return 1
 }
 
-cmd_root() {                  # internal: runs under sudo.  args: user payload_dir need_java(0|1)
-    local user="$1" payload="$2" need_java="$3" home grp
+cmd_root() {                  # internal: runs under sudo.  args: user payload_dir need_java8 need_java17 need_cab
+    local user="$1" payload="$2" nj8="$3" nj17="$4" ncab="$5" home
     [ "$(id -u)" -eq 0 ] || die "root phase must run as root"
     home=$(getent passwd "$user" | cut -d: -f6); [ -n "$home" ] || die "unknown user $user"
-    grp=$(id -gn "$user")
     set_user_paths "$home"
     step "System-level setup (as root)"
 
     have apt-get && apt-get update -qq >/dev/null 2>&1
     have python3 || pkg_install $(pkgs_for python)
     have certutil || pkg_install $(pkgs_for certutil)
+    have unzip || pkg_install $(pkgs_for unzip)
+    [ "$ncab" = 1 ] && pkg_install $(pkgs_for cabextract)
     xlibs_missing && pkg_install $(pkgs_for xlibs)
-    [ "$need_java" = 1 ] && pkg_install $(pkgs_for java)
+    [ "$nj8" = 1 ] && pkg_install $(pkgs_for java8)
+    [ "$nj17" = 1 ] && pkg_install $(pkgs_for java17)
     if ! have pcscd && [ ! -x /usr/sbin/pcscd ]; then pkg_install $(pkgs_for smartcard); fi
-
-    mkdir -p "$EOFFICE_DIR" && chown "$user:$grp" "$EOFFICE_DIR" && ok "$EOFFICE_DIR ready"
-    [ -d "$EOFFICE_LOGS" ] && chown -R "$user:$grp" "$EOFFICE_LOGS"
 
     if [ ! -f "$MTOKEN_LIB" ] && [ -f "$payload/drivers/libcryptoid_pkcs11.so" ] && [ "$(uname -m)" = x86_64 ]; then
         install -o root -g root -m 0644 "$payload/drivers/libcryptoid_pkcs11.so" "$MTOKEN_LIB" && ok "mToken PKCS#11 driver installed"
     fi
-    if ! grep -rqsi '055c' /etc/udev/rules.d/ 2>/dev/null && [ -d /etc/udev/rules.d ]; then
-        cat > "$UDEV_RULE" <<'EOF'
-# Longmai mToken CryptoID - grant the active desktop user raw USB access.
-SUBSYSTEM=="usb", ATTRS{idVendor}=="055c", ATTRS{idProduct}=="0223", TAG+="uaccess"
-SUBSYSTEM=="usb", ATTRS{idVendor}=="055c", ATTRS{idProduct}=="0229", TAG+="uaccess"
-EOF
+    if [ -d /etc/udev/rules.d ] && [ ! -f "$UDEV_RULE" ]; then
+        {   echo "# Railway DSC suite: give the logged-in desktop user raw USB access to DSC tokens"
+            echo "# (drivers such as the Longmai mToken talk to the token over USB, not PC/SC)."
+            local t; for t in $TOKEN_VIDS; do
+                case "${t%%:*}" in 04e6|072f) continue;; esac       # card readers are handled by pcscd
+                echo "SUBSYSTEM==\"usb\", ATTRS{idVendor}==\"${t%%:*}\", TAG+=\"uaccess\"   # ${t#*:}"
+            done; } > "$UDEV_RULE"
         udevadm control --reload-rules 2>/dev/null; udevadm trigger --subsystem-match=usb 2>/dev/null
-        ok "udev rule for the token installed (re-plug the token once)"
+        ok "udev rule for DSC tokens installed (re-plug the token once)"
     fi
     if ! grep -qs "$HOSTS_NAME" /etc/hosts; then
         printf '%s\t%s\n' "$HOSTS_ADDR" "$HOSTS_NAME" >> /etc/hosts && ok "/etc/hosts: $HOSTS_NAME -> $HOSTS_ADDR"
+    elif ! hosts_ok; then
+        sed -i.bak-railway-dsc "/[[:space:]]$HOSTS_NAME\([[:space:]]\|\$\)/d" /etc/hosts
+        printf '%s\t%s\n' "$HOSTS_ADDR" "$HOSTS_NAME" >> /etc/hosts && ok "/etc/hosts: $HOSTS_NAME now points to loopback"
     fi
     if hook_active; then
-        [ -e "$EOFFICE_DIR/DSC706-start.sh.vendor" ] || cp -p "$VENDOR_HOOK" "$EOFFICE_DIR/DSC706-start.sh.vendor"
-        printf '%s\n' "# Disabled by railway-dsc-suite: the signer is started by the user service" \
-                      "# eofficesigner.service; starting it here too made every login shell kill it." > "$VENDOR_HOOK"
-        ok "Vendor login-shell autostart disabled (it kept killing the running signer)"
+        cp -p "$VENDOR_HOOK" "$VENDOR_HOOK.vendor-disabled" 2>/dev/null
+        printf '%s\n' "# Disabled by railway-dsc-suite: the vendor hook started a signer from every login" \
+                      "# shell and killed the running one. The suite's user service starts it instead." > "$VENDOR_HOOK"
+        ok "Vendor login-shell autostart disabled"
     fi
     return 0
 }
@@ -566,90 +678,164 @@ copy_if_changed() {           # src dst [mode]  -> sets CHANGED=1 when it wrote
     if [ -f "$dst" ] && cmp -s "$src" "$dst"; then return 0; fi
     mkdir -p "$(dirname "$dst")"
     [ -f "$dst" ] && cp -p "$dst" "$dst.bak-$(date +%Y%m%d-%H%M%S)"
-    cp -p "$src" "$dst.new" && mv -f "$dst.new" "$dst" || die "cannot write $dst"
+    cp -p "$src" "$dst.rdsc-tmp" && mv -f "$dst.rdsc-tmp" "$dst" || die "cannot write $dst"
     [ -n "$mode" ] && chmod "$mode" "$dst"
     CHANGED=1
 }
 
+nss_dbs() {                   # every NSS certificate store a browser of this user reads
+    local d
+    echo "$U_HOME/.pki/nssdb"
+    for d in "$U_HOME"/.mozilla/firefox/* "$U_HOME"/.config/mozilla/firefox/* \
+             "$U_HOME"/snap/firefox/common/.mozilla/firefox/* \
+             "$U_HOME"/.var/app/org.mozilla.firefox/.mozilla/firefox/* \
+             "$U_HOME"/.librewolf/* "$U_HOME"/.waterfox/* \
+             "$U_HOME"/snap/chromium/current/.pki/nssdb "$U_HOME"/.var/app/*/.pki/nssdb; do
+        [ -f "$d/cert9.db" ] && echo "$d"
+    done
+}
+trust_list() {                # name|file|flags  (minimum trust: C = may vouch for servers only)
+    echo "eOfficeCA2022|$EOFFICE_CA|C,,"
+    echo "IREPSSigner eMudhra Local CA|$IREPS_DIR/certificate.crt|C,,"
+    echo "CrisSigner 127.0.0.1|$CRIS_DIR/certificate.crt|P,,"     # self-signed leaf: trusted as that one peer
+}
+cert_fp() {                   # $1 = PEM or DER file (or - for stdin) -> SHA-256 fingerprint
+    local f="$1"; [ "$f" = - ] && f=/dev/stdin
+    openssl x509 -in "$f" -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2 ||
+        openssl x509 -inform DER -in "$1" -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2
+}
+cert_in_db() {                # $1 = nss db  $2 = cert file  -> true if that certificate is in the store (any nickname)
+    local fp nick
+    have openssl || { certutil -d "sql:$1" -L -n "$3" >/dev/null 2>&1; return; }
+    fp=$(cert_fp "$2"); [ -n "$fp" ] || return 1
+    while IFS= read -r nick; do
+        [ -n "$nick" ] || continue
+        [ "$(certutil -d "sql:$1" -L -n "$nick" -a 2>/dev/null | cert_fp -)" = "$fp" ] && return 0
+    done < <(certutil -d "sql:$1" -L 2>/dev/null | tail -n +5 | sed -E 's/[[:space:]]+[^[:space:]]*,[^[:space:]]*,[^[:space:]]*[[:space:]]*$//')
+    return 1
+}
 trust_certs() {
     step "Trusting the local signer certificates in browsers"
     have certutil || { warn "certutil not available - browsers will show a certificate warning for the local signers"; return 0; }
     mkdir -p "$U_HOME/.pki/nssdb"
     [ -f "$U_HOME/.pki/nssdb/cert9.db" ] || certutil -d "sql:$U_HOME/.pki/nssdb" -N --empty-password 2>/dev/null
-    local dbs=("$U_HOME/.pki/nssdb") d n item name file flags
-    for d in "$U_HOME"/.mozilla/firefox/* "$U_HOME"/.config/mozilla/firefox/* \
-             "$U_HOME"/snap/firefox/common/.mozilla/firefox/* \
-             "$U_HOME"/.var/app/org.mozilla.firefox/.mozilla/firefox/* \
-             "$U_HOME"/.librewolf/* "$U_HOME"/.waterfox/*; do
-        [ -f "$d/cert9.db" ] && dbs+=("$d")
-    done
-    # Minimum trust only: the two vendor CAs may vouch for web servers (C) and nothing else
-    # (no client-auth, e-mail or code-signing trust); the CrisSigner certificate is a
-    # self-signed leaf whose key ships with the app, so it is trusted as that one peer (P) only.
-    local certs=("eOfficeCA2022|$PROXY_DIR/ca.pem|C,,"
-                 "IREPSSigner eMudhra Local CA|$IREPS_DIR/certificate.crt|C,,"
-                 "CrisSigner 127.0.0.1|$CRIS_DIR/certificate.crt|P,,")
-    n=0
-    for d in "${dbs[@]}"; do
-        for item in "${certs[@]}"; do
+    local d n=0 item name file flags
+    while IFS= read -r d; do
+        while IFS= read -r item; do
             name="${item%%|*}"; file="${item#*|}"; file="${file%%|*}"; flags="${item##*|}"
             [ -f "$file" ] || continue
-            if certutil -d "sql:$d" -L -n "$name" >/dev/null 2>&1; then
-                certutil -d "sql:$d" -M -n "$name" -t "$flags" 2>/dev/null
-            else
-                certutil -d "sql:$d" -A -n "$name" -t "$flags" -i "$file" 2>/dev/null || warn "could not add '$name' to $d"
+            if [ "$name" = eOfficeCA2022 ] && [ "$(cert_fp "$file")" != "$EOFFICE_CA_SHA256" ]; then
+                warn "not trusting $file: it is not NIC's eOfficeCA2022 (fingerprint mismatch)"; continue
             fi
-        done
+            if certutil -d "sql:$d" -L -n "$name" >/dev/null 2>&1; then certutil -d "sql:$d" -M -n "$name" -t "$flags" 2>/dev/null
+            elif cert_in_db "$d" "$file" "$name"; then :      # already trusted under another nickname
+            else certutil -d "sql:$d" -A -n "$name" -t "$flags" -i "$file" 2>/dev/null || warn "could not add '$name' to $d"; fi
+        done < <(trust_list)
         n=$((n+1))
-    done
+    done < <(nss_dbs)
     ok "Certificates trusted in $n browser store(s) - restart the browser to pick them up"
-    if [ -d "$U_HOME/snap/firefox" ]; then
-        info "Note: Firefox here is a snap. That is fine for these signers (the browser only talks to localhost)."
+}
+
+install_eoffice_files() {
+    local jar="" jks="" msi
+    if [ -n "$PAYLOAD" ] && [ -f "$PAYLOAD/eoffice/$EOFFICE_JAR_NAME" ]; then jar="$PAYLOAD/eoffice/$EOFFICE_JAR_NAME"
+    elif msi=$(find_msi) && [ -n "$msi" ]; then
+        info "Using the official installer: $msi"
+        jar=$(jar_from_msi "$msi") || die "could not extract the 4.1.8 jar from $msi (needs cabextract; file must be the official 4.1.8 x64 MSI)"
+    elif [ -f "$EOFFICE_JAR" ]; then jar="$EOFFICE_JAR"
+    else
+        warn "eOffice signer: no source found. Put 'Digital Signer Service 4.1.8_x64.msi' in ~/Downloads or pass --msi=FILE."
+        return 1
     fi
+    [ "$(sha "$jar")" = "$EOFFICE_JAR_SHA" ] || die "$jar is not the expected NIC 4.1.8 build (checksum mismatch)"
+    mkdir -p "$EOFFICE_DIR" "$EOFFICE_LOGS"
+    [ "$jar" = "$EOFFICE_JAR" ] || copy_if_changed "$jar" "$EOFFICE_JAR" 644
+    have openssl || die "openssl is needed to verify NIC's certificate (Ubuntu: sudo apt install openssl)"
+    jks=$(pick_valid_jks) || die "No currently valid HTTPS certificate for $HOSTS_NAME found. The one inside 4.1.8 expired on 21-06-2026; keep NIC's 7.0.x Linux installer zip in ~/Downloads (it carries the renewed certificate) and run install again."
+    copy_if_changed "$jks" "$EOFFICE_JKS" 600
+    jks_ca_pem "$EOFFICE_JKS" > "$EOFFICE_CA.new" && [ -s "$EOFFICE_CA.new" ] && copy_if_changed "$EOFFICE_CA.new" "$EOFFICE_CA" 644; rm -f "$EOFFICE_CA.new"
+    local p11; p11=$(find_p11_lib || true)
+    if [ -n "$p11" ]; then
+        printf 'name = DSCToken\nlibrary = %s\n' "$p11" > "$EOFFICE_P11CFG.new"; copy_if_changed "$EOFFICE_P11CFG.new" "$EOFFICE_P11CFG" 644; rm -f "$EOFFICE_P11CFG.new"
+    fi
+    ok "eOffice signer $EOFFICE_VER in $EOFFICE_DIR (certificate valid until $(date -d "@$(jks_expiry "$EOFFICE_JKS")" +%F))"
+}
+install_app_files() {         # $1 = cris|ireps
+    local d="$1" dst="$CRIS_DIR" f rel
+    [ "$d" = ireps ] && dst="$IREPS_DIR"
+    if [ -n "$PAYLOAD" ] && [ -d "$PAYLOAD/$d" ]; then
+        mkdir -p "$dst/lib"
+        while IFS= read -r f; do
+            rel="${f#"$PAYLOAD/$d/"}"
+            if [ -L "$f" ]; then [ -e "$dst/$rel" ] || cp -a "$f" "$dst/$rel"
+            elif ! { [ -f "$dst/$rel" ] && cmp -s "$f" "$dst/$rel"; }; then
+                mkdir -p "$(dirname "$dst/$rel")"; cp -p "$f" "$dst/$rel" || die "cannot write $dst/$rel"; CHANGED=1
+            fi
+        done < <(find "$PAYLOAD/$d" \( -type f -o -type l \))
+        ok "$(svc_label "$d") files in $dst"
+    elif svc_files_ok "$d"; then ok "$(svc_label "$d") already installed in $dst"
+    else warn "$(svc_label "$d"): not installed and not in the payload - skipped"; fi
+}
+install_runtime() {           # $1 = 8|17
+    local v="$1" dir="$JRE8_DIR" finder=find_java8
+    [ "$v" = 17 ] && { dir="$JRE17_DIR"; finder=find_java_modern; }
+    $finder >/dev/null 2>&1 && return 0
+    if [ -n "$PAYLOAD" ] && [ -x "$PAYLOAD/jre$v/bin/java" ] && "$PAYLOAD/jre$v/bin/java" -version >/dev/null 2>&1; then
+        rm -rf "$dir"; mkdir -p "$(dirname "$dir")"; cp -a "$PAYLOAD/jre$v" "$dir" && ok "Java $v runtime installed from the payload"; return 0
+    fi
+    [ "${OPT_DOWNLOAD:-1}" = 1 ] && fetch_temurin "$v" "$dir" && ok "Java $v runtime (Eclipse Temurin) installed in $dir" && return 0
+    return 1
+}
+
+migrate_legacy() {            # 7.0.6 signer + v4 bridge -> disabled (files kept)
+    have_systemd_user || return 0
+    local u any=0 prev="$CONF_DIR/previous-units-$(date +%Y%m%d-%H%M%S)"
+    for u in $LEGACY_UNITS; do
+        [ -f "$UNIT_DIR/$u.service" ] || continue
+        if systemctl --user is-enabled --quiet "$u.service" 2>/dev/null || systemctl --user is-active --quiet "$u.service" 2>/dev/null; then
+            mkdir -p "$prev"; cp -p "$UNIT_DIR/$u.service" "$prev/"; any=1
+            systemctl --user disable --now "$u.service" >/dev/null 2>&1
+            ok "Old service $u stopped and disabled (eOffice now uses $EOFFICE_VER on port $EOFFICE_PORT)"
+        fi
+    done
+    [ $any = 1 ] && info "Copies of the old service definitions: $prev"
+    return 0
 }
 
 cmd_install() {
     local no_root=0 ui_scale="" a
+    OPT_MSI=""; OPT_DOWNLOAD=1
     for a in "$@"; do case "$a" in
         --no-root) no_root=1;; --ui-scale=*) ui_scale="${a#*=}";;
+        --msi=*) OPT_MSI="${a#*=}";; --no-download) OPT_DOWNLOAD=0;;
         *) die "unknown option $a";; esac; done
     [ "$(id -u)" -ne 0 ] || die "Run this as your normal desktop user, not root. It will ask for sudo when needed."
-    echo "${B}Railway DSC Signer Suite $SUITE_VERSION - install${N}"
-    case "$(uname -m)" in x86_64) ;; *) warn "Architecture $(uname -m): the bundled Java and the mToken driver are x86_64 only; a system Java will be used and you need your token vendor's driver for this CPU.";; esac
-
+    echo "${B}Railway DSC Signer Suite $SUITE_VERSION - install / repair${N}"
+    case "$(uname -m)" in x86_64) ;; *) warn "CPU $(uname -m): the bundled Java and the mToken driver are x86_64 only; a system or downloaded Java and your token vendor's driver for this CPU are needed.";; esac
     locate_payload
-    local upgrade_only=0
-    if [ -z "$PAYLOAD" ]; then
-        [ -f "$EOFFICE_JAR" ] && [ -f "$CRIS_DIR/crissigner_app.jar" ] && [ -f "$IREPS_DIR/irepssigner_app.jar" ] && [ -f "$PROXY_DIR/eoffice_proxy.py" ] \
-            || die "No payload attached and no existing installation found. Build the .run file with 'pack' on a working machine first."
-        upgrade_only=1
-        info "No payload attached: keeping the program files already on this machine and (re)installing the self-healing layer."
-    fi
 
     # ---- does anything need root? ---------------------------------------
-    local need_java=0 reasons=()
-    if ! bundled_java_ok "$JRE_JAVA"; then
-        if [ -n "$PAYLOAD" ] && bundled_java_ok "$PAYLOAD/eoffice/jre/bin/java"; then :;
-        elif have java; then :; else need_java=1; reasons+=("a Java 17 runtime"); fi
-    fi
+    local nj8=0 nj17=0 ncab=0 reasons=()
+    if ! find_java8 >/dev/null && ! { [ -n "$PAYLOAD" ] && [ -x "$PAYLOAD/jre8/bin/java" ]; }; then nj8=1; reasons+=("Java 8 runtime"); fi
+    if ! find_java_modern >/dev/null && ! { [ -n "$PAYLOAD" ] && [ -x "$PAYLOAD/jre17/bin/java" ]; }; then nj17=1; reasons+=("Java 17 runtime"); fi
+    if ! { [ -n "$PAYLOAD" ] && [ -f "$PAYLOAD/eoffice/$EOFFICE_JAR_NAME" ]; } && [ ! -f "$EOFFICE_JAR" ] && ! have cabextract; then ncab=1; reasons+=("cabextract"); fi
     have python3 || reasons+=("python3")
     have certutil || reasons+=("certutil (NSS tools)")
+    have unzip || reasons+=("unzip")
     xlibs_missing && reasons+=("X11/font libraries for Java")
-    [ -d "$EOFFICE_DIR" ] && [ -w "$EOFFICE_DIR" ] || reasons+=("$EOFFICE_DIR")
-    [ -d "$EOFFICE_LOGS" ] && [ ! -w "$EOFFICE_LOGS" ] && reasons+=("ownership of the log folder")
     [ ! -f "$MTOKEN_LIB" ] && [ -n "$PAYLOAD" ] && [ -f "$PAYLOAD/drivers/libcryptoid_pkcs11.so" ] && [ "$(uname -m)" = x86_64 ] && reasons+=("mToken driver")
-    [ -d /etc/udev/rules.d ] && ! grep -rqsi '055c' /etc/udev/rules.d/ && reasons+=("udev rule for the token")
-    grep -qs "$HOSTS_NAME" /etc/hosts || reasons+=("/etc/hosts entry")
+    [ -d /etc/udev/rules.d ] && [ ! -f "$UDEV_RULE" ] && reasons+=("udev rule for DSC tokens")
+    hosts_ok || reasons+=("/etc/hosts entry")
     hook_active && reasons+=("disable the vendor autostart hook")
 
-    if [ ${#reasons[@]} -gt 0 ] && [ $no_root = 0 ]; then
+    if [ ${#reasons[@]} -gt 0 ] && [ $no_root = 0 ] && [ "${RDSC_TEST_NOROOT:-}" != 1 ]; then
         step "Administrator rights needed for: $(IFS=,; echo "${reasons[*]}" | sed 's/,/, /g')"
         if have sudo; then
-            sudo bash "$SELF" __root "$(id -un)" "${PAYLOAD:-/nonexistent}" "$need_java" || die "system-level setup failed"
+            sudo bash "$SELF" __root "$(id -un)" "${PAYLOAD:-/nonexistent}" "$nj8" "$nj17" "$ncab" || warn "system-level setup reported a problem - continuing"
         else
             warn "sudo is not installed. Run this as root, then run install again:"
-            info "su -c 'bash $SELF __root $(id -un) ${PAYLOAD:-/nonexistent} $need_java'"
-            [ -z "$PAYLOAD_TMP" ] || { trap - EXIT; info "(payload kept in $PAYLOAD_TMP for that command)"; }
+            info "su -c 'bash $SELF __root $(id -un) ${PAYLOAD:-/nonexistent} $nj8 $nj17 $ncab'"
+            [ -z "$PAYLOAD_TMP" ] || { PAYLOAD_TMP=""; info "(payload kept in $PAYLOAD for that command)"; }
             exit 1
         fi
     elif [ ${#reasons[@]} -gt 0 ]; then
@@ -659,86 +845,55 @@ cmd_install() {
     fi
     have python3 || die "python3 is required and could not be installed"
 
-    # ---- program files ----------------------------------------------------
-    step "Installing program files"
-    CHANGED=0
-    mkdir -p "$CONF_DIR" "$SHARE_DIR" "$STATE_DIR" "$EOFFICE_WORK/conf" "$PROXY_DIR"
-    chmod 700 "$PROXY_DIR"
-    if [ $upgrade_only = 0 ]; then
-        [ -w "$EOFFICE_DIR" ] || die "$EOFFICE_DIR is not writable - run install again without --no-root"
-        if ! bundled_java_ok "$JRE_JAVA" && [ -d "$PAYLOAD/eoffice/jre" ] && bundled_java_ok "$PAYLOAD/eoffice/jre/bin/java"; then
-            rm -rf "$EOFFICE_DIR/jre"; cp -a "$PAYLOAD/eoffice/jre" "$EOFFICE_DIR/" || die "cannot copy the Java runtime"
-            CHANGED=1; ok "Bundled Java 17 runtime installed"
-        fi
-        copy_if_changed "$PAYLOAD/eoffice/DigitalSignerService-7.0.6.jar" "$EOFFICE_JAR" 644
-        [ -f "$PAYLOAD/eoffice/DSC48x48.png" ] && copy_if_changed "$PAYLOAD/eoffice/DSC48x48.png" "$EOFFICE_DIR/DSC48x48.png" 644
-        local d dst f rel
-        for d in cris ireps; do
-            dst="$CRIS_DIR"; [ $d = ireps ] && dst="$IREPS_DIR"
-            mkdir -p "$dst/lib"
-            while IFS= read -r f; do
-                rel="${f#"$PAYLOAD/$d/"}"
-                if [ -L "$f" ]; then [ -e "$dst/$rel" ] || cp -a "$f" "$dst/$rel"
-                elif ! { [ -f "$dst/$rel" ] && cmp -s "$f" "$dst/$rel"; }; then
-                    mkdir -p "$(dirname "$dst/$rel")"; cp -p "$f" "$dst/$rel" || die "cannot write $dst/$rel"; CHANGED=1
-                fi
-            done < <(find "$PAYLOAD/$d" \( -type f -o -type l \))
-        done
-        copy_if_changed "$PAYLOAD/proxy/eoffice_proxy.py" "$PROXY_DIR/eoffice_proxy.py" 755
-        for f in fullchain.pem ca.pem cert.pem; do [ -f "$PAYLOAD/proxy/$f" ] && copy_if_changed "$PAYLOAD/proxy/$f" "$PROXY_DIR/$f" 644; done
-        copy_if_changed "$PAYLOAD/proxy/key.pem" "$PROXY_DIR/key.pem" 600
-        ok "eOffice signer, bridge, CrisSigner and IREPSSigner files in place"
-    else
-        ok "Existing program files kept"
-    fi
-    if ! bundled_java_ok "$JRE_JAVA" && ! have java; then die "No working Java runtime. Install a Java 17 JRE with your package manager and run install again."; fi
+    # ---- runtimes and program files ------------------------------------------
+    step "Java runtimes"
+    install_runtime 8  && ok "eOffice  -> Java 8:  $(find_java8)"        || warn "No Java 8 runtime - the eOffice signer cannot start (Ubuntu: sudo apt install openjdk-8-jre)"
+    install_runtime 17 && ok "CRIS/IREPS -> Java $(java_major "$(find_java_modern)"): $(find_java_modern)" || warn "No Java 11+ runtime - CRIS/IREPS cannot start (Ubuntu: sudo apt install openjdk-17-jre)"
 
-    # ---- settings -----------------------------------------------------------
+    step "Program files"
+    CHANGED=0
+    mkdir -p "$CONF_DIR" "$SHARE_DIR" "$STATE_DIR"
     if [ ! -f "$CONF_FILE" ]; then
-        if [ -z "$ui_scale" ]; then
-            ui_scale=$(sed -n 's/.*uiScale=\([0-9.]*\).*/\1/p' "$UNIT_DIR/eofficesigner.service" 2>/dev/null | head -1)
-            [ -n "$ui_scale" ] || ui_scale=1
-        fi
         cat > "$CONF_FILE" <<EOF
-# Railway DSC Signer Suite settings.  After editing:  railway-dsc restart
-# Size of the signer windows and PIN prompt: 1 = normal, 2 = HiDPI / 4K screens.
-DSC_UI_SCALE=$ui_scale
+# Railway DSC Signer Suite settings.  After editing:  railway-dsc install
+# Size of the CRIS/IREPS windows: 1 = normal, 2 = HiDPI (Java 8 ignores it).
+DSC_UI_SCALE=${ui_scale:-1}
 # Token driver (PKCS#11 library). Leave empty to auto-detect.
 P11_LIB=""
-# Addresses the eOffice bridge listens on (loopback only).
-DSC_PROXY_BIND="127.0.0.1,$HOSTS_ADDR"
+# Force a particular Java (leave empty to auto-detect).
+JAVA8=""
+JAVA17=""
 EOF
-    elif [ -n "$ui_scale" ]; then
-        sed -i "s/^DSC_UI_SCALE=.*/DSC_UI_SCALE=$ui_scale/" "$CONF_FILE"
-    fi
+    elif [ -n "$ui_scale" ]; then sed -i "s/^DSC_UI_SCALE=.*/DSC_UI_SCALE=$ui_scale/" "$CONF_FILE"; fi
     # shellcheck disable=SC1090
     . "$CONF_FILE"
-
+    install_eoffice_files || true
+    install_app_files cris
+    install_app_files ireps
+    SVCS="$(present_svcs)"
+    [ -n "$SVCS" ] || die "Nothing to run: no signer program files are installed."
     local p11; p11=$(find_p11_lib || true)
-    if [ ! -s "$EOFFICE_WORK/conf/all_tokens.properties" ] && [ -n "$p11" ]; then
-        local tname="Token"; [ "$p11" = "$MTOKEN_LIB" ] && tname="mToken"
-        printf '1.name=%s\n1.path=%s\n1.status=1\n' "$tname" "$p11" > "$EOFFICE_WORK/conf/all_tokens.properties"
-        printf 'service.start=false\nservice.locale=en_in\nprocess.type=custom\nselected.token.name=%s\nselected.token.path=%s\nused.token.name=%s\nused.token.path=%s\n' \
-            "$tname" "$p11" "$tname" "$p11" > "$EOFFICE_WORK/conf/default_token.properties"
-        ok "eOffice signer pointed at token driver $p11"
-    fi
-    [ -n "$p11" ] && ok "Token driver: $p11" || warn "No PKCS#11 token driver found. Install your token vendor's Linux driver, then run: railway-dsc restart"
+    [ -n "$p11" ] && ok "Token driver: $p11" || warn "No PKCS#11 token driver found. Install your token vendor's Linux driver, then run: railway-dsc install"
 
     # ---- self-healing layer ---------------------------------------------------
-    step "Installing launchers, services and the watchdog"
-    local before after
-    before=$(cat "$LAUNCH" "$UNIT_DIR"/eofficesigner*.service "$UNIT_DIR"/crissigner.service "$UNIT_DIR"/irepssigner.service 2>/dev/null | sha256sum)
-    if ls "$UNIT_DIR"/eofficesigner*.service "$UNIT_DIR"/crissigner.service "$UNIT_DIR"/irepssigner.service >/dev/null 2>&1 \
-       && ! grep -qs 'railway-dsc-suite' "$UNIT_DIR/eofficesigner.service"; then
-        local prev; prev="$CONF_DIR/previous-units-$(date +%Y%m%d-%H%M%S)"; mkdir -p "$prev"
-        cp -p "$UNIT_DIR"/eofficesigner*.service "$UNIT_DIR"/crissigner.service "$UNIT_DIR"/irepssigner.service "$prev/" 2>/dev/null
-        info "Previous service definitions saved in $prev"
-    fi
+    step "Services and watchdog"
+    local before after u
+    before=$(cat "$LAUNCH" "$UNIT_DIR"/eofficesigner418.service "$UNIT_DIR"/crissigner.service "$UNIT_DIR"/irepssigner.service 2>/dev/null | sha256sum)
+    for u in eofficesigner418 crissigner irepssigner; do
+        if [ -f "$UNIT_DIR/$u.service" ] && ! grep -qs 'railway-dsc-suite' "$UNIT_DIR/$u.service"; then
+            local prev="$CONF_DIR/previous-units-$(date +%Y%m%d)"; mkdir -p "$prev"; cp -p "$UNIT_DIR/$u.service" "$prev/"
+            info "Previous $u.service saved in $prev"
+        fi
+    done
     write_probe; write_launcher; install_self
-    if have_systemd_user; then
+    if [ "${RDSC_TEST_NOSTART:-}" = 1 ]; then
+        write_units; info "(test mode: services not enabled or started)"
+    elif have_systemd_user; then
+        migrate_legacy
         write_units
         systemctl --user daemon-reload
-        systemctl --user enable eofficesigner.service eofficesigner-proxy.service crissigner.service irepssigner.service railway-dsc-heal.timer >/dev/null 2>&1
+        # shellcheck disable=SC2046
+        systemctl --user enable $(unit_names) >/dev/null 2>&1
         rm -f "$AUTOSTART"
         ok "systemd user services + watchdog timer enabled"
     else
@@ -746,12 +901,12 @@ EOF
         printf '[Desktop Entry]\nType=Application\nName=Railway DSC signer supervisor\nExec=%s supervise\nX-GNOME-Autostart-enabled=true\nNoDisplay=true\n' "$BIN" > "$AUTOSTART"
         ok "No systemd user session here: supervisor registered in desktop autostart"
     fi
-    after=$(cat "$LAUNCH" "$UNIT_DIR"/eofficesigner*.service "$UNIT_DIR"/crissigner.service "$UNIT_DIR"/irepssigner.service 2>/dev/null | sha256sum)
+    after=$(cat "$LAUNCH" "$UNIT_DIR"/eofficesigner418.service "$UNIT_DIR"/crissigner.service "$UNIT_DIR"/irepssigner.service 2>/dev/null | sha256sum)
     [ "$before" = "$after" ] || CHANGED=1
     refresh_keep
     ok "Repair copies stored ($(wc -l < "$MANIFEST") files, $(du -sh "$KEEP_DIR" | cut -f1))"
-
     trust_certs
+    [ "${RDSC_TEST_NOSTART:-}" = 1 ] && return 0
 
     # ---- start and verify -----------------------------------------------------
     step "Starting services"
@@ -759,7 +914,6 @@ EOF
     rm -f "$STATE_DIR/stopped"
     if have_systemd_user; then
         for s in $SVCS; do
-            # restart only what changed or is down; an untouched healthy service keeps running
             if [ "$CHANGED" = 1 ] || ! svc_active "$s"; then systemctl --user restart "$(svc_unit "$s").service"; fi
         done
         systemctl --user restart railway-dsc-heal.timer
@@ -775,14 +929,14 @@ EOF
     cmd_status
     local rc=$?
     echo
-    if [ $rc = 0 ]; then ok "Installation complete. Everyday command: ${B}railway-dsc status${N}"
-    else warn "Installed, but something is not healthy yet - see above. The watchdog will keep retrying; check: railway-dsc logs"; fi
+    if [ $rc = 0 ]; then ok "Done. Log out of the web portals and back in so they find the signers. Check any time: ${B}railway-dsc doctor${N}"
+    else warn "Installed, but something is not healthy yet - see above, or run: railway-dsc doctor"; fi
     case ":$PATH:" in *":$U_HOME/.local/bin:"*) ;; *) info "($U_HOME/.local/bin is not in PATH yet - log out and in, or call $BIN directly)";; esac
     return $rc
 }
 
 # ===================================================================== heal ===
-restore_files() {             # returns list of services whose files were repaired
+restore_files() {             # prints the services whose files were repaired
     [ -f "$MANIFEST" ] || return 0
     local h f cur
     while read -r h f; do
@@ -795,43 +949,51 @@ restore_files() {             # returns list of services whose files were repair
             if cp -p "$KEEP_DIR/$h" "$f"; then
                 hlog "REPAIRED file $f (was ${cur:-missing})"
                 case "$f" in
-                    "$EOFFICE_JAR") echo eoffice;; "$CRIS_DIR"/*) echo cris;; "$IREPS_DIR"/*) echo ireps;;
-                    "$PROXY_DIR"/*) echo proxy;; "$LAUNCH") echo "eoffice proxy cris ireps";;
+                    "$EOFFICE_DIR"/*) echo eoffice;; "$CRIS_DIR"/*) echo cris;; "$IREPS_DIR"/*) echo ireps;;
+                    "$LAUNCH") echo "$SVCS";;
                 esac
             else hlog "ERROR could not restore $f"; fi
         else
-            hlog "ERROR $f is damaged and no good repair copy exists - re-run the installer"
+            hlog "ERROR $f is damaged and no good repair copy exists - run: railway-dsc install"
         fi
     done < "$MANIFEST"
 }
 
 heal_once() {
-    local dry="${1:-0}" s acted=0 repaired
+    local dry="${1:-0}" s repaired
     mkdir -p "$STATE_DIR"
     [ -f "$STATE_DIR/stopped" ] && return 0      # user ran "railway-dsc stop"
     # 1. program files
     if [ "$dry" = 0 ]; then repaired=$(restore_files | tr '\n' ' '); else repaired=""; fi
-    # 2. service definitions
     if have_systemd_user; then
-        local missing=0
+        # 2. service definitions
+        local missing=0 u
         for s in $SVCS; do [ -f "$UNIT_DIR/$(svc_unit "$s").service" ] || missing=1; done
         [ -f "$UNIT_DIR/railway-dsc-heal.timer" ] || missing=1
         if [ $missing = 1 ] && [ "$dry" = 0 ]; then
             write_units; systemctl --user daemon-reload
-            systemctl --user enable eofficesigner.service eofficesigner-proxy.service crissigner.service irepssigner.service railway-dsc-heal.timer >/dev/null 2>&1
-            hlog "REPAIRED missing service definitions"; acted=1
+            # shellcheck disable=SC2046
+            systemctl --user enable $(unit_names) >/dev/null 2>&1
+            hlog "REPAIRED missing service definitions"
         fi
-        # 3. duplicate eOffice signer instances (each new one kill -9s whoever holds the port)
+        # 3. the old 7.0.6 signer / v4 bridge must not come back (the bridge steals port 55101)
+        for u in $LEGACY_UNITS; do
+            if systemctl --user is-active --quiet "$u.service" 2>/dev/null; then
+                if [ "$dry" = 0 ]; then systemctl --user disable --now "$u.service" >/dev/null 2>&1; hlog "DISABLED legacy service $u"
+                else echo "would disable legacy service $u"; fi
+            fi
+        done
+        # 4. duplicate eOffice signer instances started outside the service
         local main p
         main=$(svc_pid eoffice)
-        for p in $(pgrep -u "$(id -u)" -f 'DigitalSignerService-7[.]0[.]6[.]jar' 2>/dev/null); do
+        for p in $(pgrep -u "$(id -u)" -f 'DigitalSignerService4[.]1[.]8[.]jar' 2>/dev/null); do
             [ "$p" = "$main" ] && continue
-            grep -qs 'eofficesigner.service' "/proc/$p/cgroup" && continue
-            if [ "$dry" = 0 ]; then kill "$p" 2>/dev/null && hlog "REMOVED duplicate eOffice signer instance pid $p"; acted=1
+            grep -qs 'eofficesigner418.service' "/proc/$p/cgroup" && continue
+            if [ "$dry" = 0 ]; then kill "$p" 2>/dev/null && hlog "REMOVED duplicate eOffice signer instance pid $p"
             else echo "would remove duplicate eOffice signer pid $p"; fi
         done
     fi
-    # 4. liveness
+    # 5. liveness
     for s in $SVCS; do
         local why="" cnt=0
         case " $repaired " in *" $s "*) why="program file repaired";; esac
@@ -851,26 +1013,27 @@ heal_once() {
         fi
         if [ "$dry" = 0 ]; then
             rm -f "$STATE_DIR/fail.$s"
-            svc_restart "$s"; hlog "RESTARTED $(svc_label "$s"): $why"; acted=1
+            svc_restart "$s"; hlog "RESTARTED $(svc_label "$s"): $why"
         else echo "would restart $(svc_label "$s"): $why"; fi
     done
-    # 5. log growth (the eOffice signer logs at DEBUG level and never rotates)
+    # 6. log growth
     local lf
-    for lf in "$EOFFICE_LOGS/output.log" "$EOFFICE_LOGS/errorOutput.log" "$HEAL_LOG"; do
+    for lf in "$EOFFICE_LOGS/output.log" "$EOFFICE_LOGS/error.log" "$HEAL_LOG"; do
         if [ -f "$lf" ] && [ "$(stat -c %s "$lf" 2>/dev/null || echo 0)" -gt 20971520 ] && [ "$dry" = 0 ]; then
             tail -c 2097152 "$lf" > "$lf.1" 2>/dev/null && : > "$lf" && hlog "ROTATED $lf"
         fi
     done
-    # 6. things only an administrator can fix: report, once a day
+    # 7. things only an administrator can fix: report, once a day
     local drift=""
     hook_active && drift="$drift vendor-autostart-hook-is-back"
-    grep -qs "$HOSTS_NAME" /etc/hosts || drift="$drift hosts-entry-missing"
+    hosts_ok || drift="$drift hosts-entry-missing"
+    svc_files_ok eoffice && ! jks_valid "$EOFFICE_JKS" && drift="$drift eoffice-https-certificate-expired"
     if [ -n "$drift" ] && [ "$dry" = 0 ]; then
         local today; today=$(date +%F)
         if [ "$(cat "$STATE_DIR/drift.day" 2>/dev/null)" != "$today" ]; then
             echo "$today" > "$STATE_DIR/drift.day"
-            hlog "NEEDS ADMIN:$drift - fix with: bash $BIN install"
-            have notify-send && notify-send "Railway DSC signers" "A system setting needs repair. Run: railway-dsc install" 2>/dev/null
+            hlog "NEEDS ADMIN:$drift - fix with: railway-dsc install"
+            have notify-send && notify-send "Railway DSC signers" "Something needs repair. Run: railway-dsc doctor" 2>/dev/null
         fi
     fi
     return 0
@@ -906,39 +1069,161 @@ cmd_supervise() {             # fallback for systems without a systemd user sess
 # =================================================================== status ===
 cmd_status() {
     local rc=0 s state
-    echo; echo "${B}Railway DSC Signer Suite - status${N}"
+    echo; echo "${B}Railway DSC Signer Suite $SUITE_VERSION - status${N}"
+    [ -n "$SVCS" ] || { fail "No signer installed. Run: railway-dsc install"; return 1; }
     for s in $SVCS; do
         if ! svc_active "$s"; then state="${R}not running${N}"; rc=1
         elif probe "$s"; then state="${G}healthy${N}"
         else state="${Y}running, not answering yet${N}"; rc=1; fi
-        printf '  %-28s port %-6s %s\n' "$(svc_label "$s")" "$(svc_port "$s")" "$state"
+        printf '  %-30s port %-6s %s\n' "$(svc_label "$s")" "$(svc_port "$s")" "$state"
     done
     if have_systemd_user; then
-        if systemctl --user is-active --quiet railway-dsc-heal.timer; then printf '  %-28s %s\n' "Watchdog" "${G}active${N} (every 3 minutes)"
-        else printf '  %-28s %s\n' "Watchdog" "${R}not active${N}"; rc=1; fi
+        if systemctl --user is-active --quiet railway-dsc-heal.timer; then printf '  %-30s %s\n' "Watchdog" "${G}active${N} (every 3 minutes)"
+        else printf '  %-30s %s\n' "Watchdog" "${R}not active${N}"; rc=1; fi
     else
         local p; p=$(cat "$STATE_DIR/supervisor.pid" 2>/dev/null)
-        if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then printf '  %-28s %s\n' "Supervisor" "${G}active${N}"
-        else printf '  %-28s %s\n' "Supervisor" "${R}not running${N}"; rc=1; fi
+        if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then printf '  %-30s %s\n' "Supervisor" "${G}active${N}"
+        else printf '  %-30s %s\n' "Supervisor" "${R}not running${N}"; rc=1; fi
     fi
-    local p11; [ -f "$CONF_FILE" ] && . "$CONF_FILE"; p11=$(find_p11_lib || true)
-    printf '  %-28s %s\n' "Token driver" "${p11:-${Y}none found${N}}"
-    if token_present; then printf '  %-28s %s\n' "mToken USB token" "${G}plugged in${N}"
-    else printf '  %-28s %s\n' "mToken USB token" "${Y}not detected${N} (plug it in before signing)"; fi
-    hook_active && { printf '  %-28s %s\n' "Vendor autostart hook" "${R}active - it will kill the signer; run: railway-dsc install${N}"; rc=1; }
-    grep -qs "$HOSTS_NAME" /etc/hosts || { printf '  %-28s %s\n' "/etc/hosts entry" "${R}missing; run: railway-dsc install${N}"; rc=1; }
+    local p11 tk; [ -f "$CONF_FILE" ] && . "$CONF_FILE"; p11=$(find_p11_lib || true)
+    printf '  %-30s %s\n' "Token driver" "${p11:-${Y}none found${N}}"
+    tk=$(tokens_plugged | cut -d: -f2 | paste -sd, -)
+    if [ -n "$tk" ]; then printf '  %-30s %s\n' "USB token" "${G}$tk${N}"
+    else printf '  %-30s %s\n' "USB token" "${Y}not detected${N} (plug it in before signing)"; fi
+    hosts_ok || { printf '  %-30s %s\n' "/etc/hosts entry" "${R}missing; run: railway-dsc install${N}"; rc=1; }
     if [ -f "$HEAL_LOG" ]; then
-        echo "  Last watchdog actions:"; grep -E 'RESTARTED|REPAIRED|REMOVED|ERROR|NEEDS ADMIN' "$HEAL_LOG" | tail -n 4 | sed 's/^/    /'
+        echo "  Last watchdog actions:"; grep -E 'RESTARTED|REPAIRED|REMOVED|DISABLED|ERROR|NEEDS ADMIN' "$HEAL_LOG" | tail -n 4 | sed 's/^/    /'
     fi
     return $rc
 }
 
+# =================================================================== doctor ===
+D_FAILS=0; D_WARNS=0
+d_ok()   { printf '  %s %s\n' "${G}ok  ${N}" "$*"; }
+d_warn() { printf '  %s %s\n' "${Y}warn${N}" "$*"; D_WARNS=$((D_WARNS+1)); }
+d_fail() { printf '  %s %s\n' "${R}FAIL${N}" "$*"; D_FAILS=$((D_FAILS+1)); }
+d_fix()  { printf '         %s\n' "-> $*"; }
+d_head() { echo; echo "${B}$*${N}"; }
+
+cmd_doctor() {
+    echo "${B}Railway DSC Signer Suite $SUITE_VERSION - doctor${N}  ($(date '+%F %T'))"
+    [ -f "$CONF_FILE" ] && . "$CONF_FILE"
+    local s j f u o e
+
+    d_head "System"
+    if [ -f /etc/os-release ]; then . /etc/os-release; d_ok "${PRETTY_NAME:-unknown Linux}, kernel $(uname -r), $(uname -m)"; fi
+    case "$(uname -m)" in x86_64) ;; *) d_warn "CPU $(uname -m): the mToken driver and bundled runtimes are x86_64 only";; esac
+    if have_systemd_user; then d_ok "systemd user session available"; else d_warn "no systemd user session - the desktop-autostart supervisor is used instead"; fi
+    if [ -n "${WAYLAND_DISPLAY:-}" ]; then d_ok "Wayland session (signers use XWayland - fine)"; fi
+    if ls /tmp/.X11-unix/X* >/dev/null 2>&1; then d_ok "X display socket present ($(ls /tmp/.X11-unix | tr '\n' ' '))"
+    else d_fail "no X display socket - the signers' PIN window cannot open"; d_fix "log in to a graphical desktop session"; fi
+    for f in python3 certutil ss unzip; do have "$f" || { d_warn "'$f' missing"; d_fix "railway-dsc install (installs it)"; }; done
+
+    d_head "Java"
+    if j=$(find_java8); then d_ok "Java 8 for eOffice: $j"
+    else d_fail "no Java 8 with GUI libraries (4.1.8 needs exactly Java 8)"; d_fix "Ubuntu: sudo apt install openjdk-8-jre   (or: railway-dsc install, which can download one)"
+        ls /usr/lib/jvm/java-8-*/jre/bin/java >/dev/null 2>&1 && d_fix "a headless Java 8 is installed - the full JRE package adds the GUI libraries"; fi
+    if j=$(find_java_modern); then d_ok "Java $(java_major "$j") for CRIS/IREPS: $j"
+    else d_fail "no Java 11+ with GUI libraries"; d_fix "Ubuntu: sudo apt install openjdk-17-jre"; fi
+
+    d_head "Program files"
+    for s in $ALL_SVCS; do
+        if svc_files_ok "$s"; then d_ok "$(svc_label "$s") installed"
+        else d_warn "$(svc_label "$s") not installed"; d_fix "railway-dsc install   (eOffice: with the 4.1.8 MSI in ~/Downloads)"; fi
+    done
+    if [ -f "$EOFFICE_JAR" ]; then
+        [ "$(sha "$EOFFICE_JAR")" = "$EOFFICE_JAR_SHA" ] && d_ok "eOffice jar is the genuine NIC 4.1.8 build" || { d_fail "eOffice jar checksum mismatch (damaged or not 4.1.8)"; d_fix "railway-dsc heal   (restores from the kept copy)"; }
+        [ -f "$EOFFICE_P11CFG" ] && d_ok "pkcs11cfg -> $(sed -n 's/^library *= *//p' "$EOFFICE_P11CFG")" || { d_fail "pkcs11cfg missing - the eOffice signer cannot reach the token"; d_fix "railway-dsc install"; }
+    fi
+    if [ -f "$MANIFEST" ]; then
+        o=0; while read -r e f; do [ "$(sha "$f")" = "$e" ] || o=$((o+1)); done < "$MANIFEST"
+        [ $o = 0 ] && d_ok "all $(wc -l < "$MANIFEST") watched files intact" || { d_warn "$o watched file(s) changed or missing"; d_fix "railway-dsc heal"; }
+    fi
+
+    d_head "Certificates and browsers"
+    if [ -f "$EOFFICE_JKS" ]; then
+        e=$(jks_expiry "$EOFFICE_JKS" || true)
+        if [ -n "$e" ] && [ "$e" -gt "$(date +%s)" ]; then
+            [ $(( (e - $(date +%s)) / 86400 )) -lt 60 ] && d_warn "eOffice HTTPS certificate expires $(date -d "@$e" +%F) - get a newer NIC signer package before then" \
+                || d_ok "eOffice HTTPS certificate valid until $(date -d "@$e" +%F)"
+        else d_fail "eOffice HTTPS certificate expired - browsers refuse the signer"; d_fix "keep NIC's latest Linux signer zip in ~/Downloads and run: railway-dsc install"; fi
+    fi
+    if have certutil; then
+        local db item name file miss
+        while IFS= read -r db; do
+            miss=""
+            while IFS= read -r item; do
+                name="${item%%|*}"; file="${item#*|}"; file="${file%%|*}"
+                [ -f "$file" ] || continue
+                case "$name" in CrisSigner*)       # Firefox honours a site exception for this self-signed leaf
+                    grep -qs '^127\.0\.0\.1:2039' "$db/cert_override.txt" && continue;; esac
+                cert_in_db "$db" "$file" "$name" || miss="$miss '$name'"
+            done < <(trust_list)
+            [ -z "$miss" ] && d_ok "trusted in ${db/#$U_HOME/~}" || { d_warn "${db/#$U_HOME/~} lacks:$miss"; d_fix "railway-dsc trust, restart the browser"
+                case "$miss" in *CrisSigner*) [ -f "$db/cert_override.txt" ] || [ -f "$db/prefs.js" ] && d_fix "Firefox: open https://127.0.0.1:2039 once and accept the certificate";; esac; }
+        done < <(nss_dbs)
+    fi
+    [ -d "$U_HOME/snap/firefox" ] && d_ok "Firefox is a snap: fine, it may reach the local signers"
+
+    d_head "Network names and ports"
+    if hosts_ok; then d_ok "$HOSTS_NAME -> $(hosts_addr) (loopback)"
+    else d_fail "$HOSTS_NAME does not resolve to loopback (eOffice cannot reach the signer)"; d_fix "railway-dsc install   (adds '$HOSTS_ADDR $HOSTS_NAME' to /etc/hosts)"; fi
+    for s in $ALL_SVCS; do
+        o=$(port_owner "$(svc_port "$s")")
+        if [ -n "$o" ]; then
+            case "$s:$o" in
+                eoffice:*python*) d_fail "port $(svc_port "$s") is held by the old v4 bridge ($o)"; d_fix "railway-dsc install   (disables eofficesigner-proxy)";;
+                *) d_ok "port $(svc_port "$s") listening: $o";;
+            esac
+        else svc_files_ok "$s" && d_warn "nothing listens on port $(svc_port "$s") ($(svc_label "$s"))"; fi
+    done
+    o=$(port_owner 55100); [ -n "$o" ] && { d_warn "port 55100 is in use ($o): the 4.1.8 signer then refuses to start by itself"; d_fix "stop whatever runs there"; }
+    o=$(port_owner 55103); [ -n "$o" ] && d_warn "an eOffice 7.x signer still runs on 55103 ($o) - harmless, but not used by 4.1 portals"
+
+    d_head "Token"
+    local tk; tk=$(tokens_plugged)
+    if [ -n "$tk" ]; then d_ok "USB token(s): $(echo "$tk" | cut -d: -f2 | paste -sd, -)"
+    else d_warn "no known DSC token on USB"; d_fix "plug the token in (try another port); 'lsusb' should list it"; fi
+    if j=$(find_p11_lib); then
+        d_ok "PKCS#11 driver: $j"
+        if have ldd; then o=$(ldd "$j" 2>/dev/null | awk '/not found/{print $1}' | paste -sd' ' -); [ -n "$o" ] && { d_fail "driver needs missing libraries: $o"; d_fix "install those packages (Ubuntu: apt-file search <name>)"; }; fi
+    else d_fail "no PKCS#11 driver found for any common token"; d_fix "install the token vendor's Linux driver (mToken: libcryptoid_pkcs11.so in /usr/lib)"; fi
+    [ -f "$UDEV_RULE" ] || grep -rqsi '055c\|096e\|163c' /etc/udev/rules.d/ 2>/dev/null && d_ok "udev rule for tokens present" || { d_warn "no udev rule - token may need root access"; d_fix "railway-dsc install"; }
+    if have systemctl && systemctl is-active --quiet pcscd.socket 2>/dev/null || pgrep -x pcscd >/dev/null 2>&1; then d_ok "pcscd available (smart-card readers)"; fi
+
+    d_head "Services"
+    have_systemd_user && for u in $LEGACY_UNITS; do
+        systemctl --user is-active --quiet "$u.service" 2>/dev/null && { d_fail "old service $u is running"; d_fix "railway-dsc install   (disables it)"; }
+    done
+    hook_active && { d_fail "vendor login-shell hook $VENDOR_HOOK is active (starts/kills signers at every login)"; d_fix "railway-dsc install"; }
+    for s in $SVCS; do
+        if ! svc_active "$s"; then d_fail "$(svc_label "$s") not running"; d_fix "railway-dsc restart; then: railway-dsc logs"
+        elif probe "$s"; then d_ok "$(svc_label "$s") answers on port $(svc_port "$s")"
+        else d_warn "$(svc_label "$s") running but not answering"; d_fix "railway-dsc heal"; fi
+    done
+    if have_systemd_user; then systemctl --user is-active --quiet railway-dsc-heal.timer && d_ok "watchdog timer active" || { d_warn "watchdog timer not active"; d_fix "railway-dsc install"; }; fi
+    if [ -f "$EOFFICE_LOGS/error.log" ] && grep -q 'AWTError\|Assistive Technology' "$EOFFICE_LOGS/error.log" 2>/dev/null; then
+        d_warn "eOffice log shows the Java accessibility crash (old launcher?)"; d_fix "railway-dsc install"
+    fi
+    if [ -f "$EOFFICE_APPLOGS/app-info.log" ]; then
+        o=$(grep -E '\[ERROR\]' "$EOFFICE_APPLOGS/app-info.log" 2>/dev/null | tail -1 | cut -c1-160)
+        [ -n "$o" ] && d_warn "last eOffice signer error: $o"
+    fi
+
+    echo
+    if [ $D_FAILS = 0 ] && [ $D_WARNS = 0 ]; then ok "Everything looks right."
+    elif [ $D_FAILS = 0 ]; then warn "$D_WARNS warning(s), no failures."
+    else fail "$D_FAILS problem(s), $D_WARNS warning(s). Most are fixed by: railway-dsc install"; fi
+    [ $D_FAILS = 0 ]
+}
+
+# ================================================================ controls ===
 cmd_ctl() {                   # start|stop|restart
     local s
     case "$1" in
         stop)    touch "$STATE_DIR/stopped" 2>/dev/null
                  have_systemd_user && systemctl --user stop railway-dsc-heal.timer 2>/dev/null
-                 for s in proxy cris ireps eoffice; do svc_stop "$s"; done; ok "All signer services stopped (watchdog paused). Start again with: railway-dsc start";;
+                 for s in $SVCS; do svc_stop "$s"; done; ok "All signer services stopped (watchdog paused). Start again with: railway-dsc start";;
         start|restart)
                  rm -f "$STATE_DIR/stopped"
                  if have_systemd_user; then
@@ -951,57 +1236,65 @@ cmd_ctl() {                   # start|stop|restart
 
 cmd_logs() {
     echo "${B}--- watchdog ($HEAL_LOG)${N}"; tail -n 20 "$HEAL_LOG" 2>/dev/null
-    echo "${B}--- eOffice signer errors${N}"; tail -n 15 "$EOFFICE_LOGS/errorOutput.log" 2>/dev/null | cut -c1-200
+    echo "${B}--- eOffice signer ($EOFFICE_APPLOGS/app-info.log)${N}"; tail -n 15 "$EOFFICE_APPLOGS/app-info.log" 2>/dev/null | cut -c1-200
+    echo "${B}--- eOffice signer errors${N}"; grep -v '^Inside Filter$' "$EOFFICE_LOGS/error.log" 2>/dev/null | tail -n 10 | cut -c1-200
+    local s
     if have_systemd_user && have journalctl; then
-        local s; for s in proxy cris ireps; do echo "${B}--- $(svc_label "$s")${N}"; journalctl --user -u "$(svc_unit "$s").service" --no-pager -n 12 2>/dev/null | cut -c1-200; done
+        for s in cris ireps; do echo "${B}--- $(svc_label "$s")${N}"; journalctl --user -u "$(svc_unit "$s").service" --no-pager -n 12 2>/dev/null | cut -c1-200; done
     else
-        local s; for s in proxy cris ireps; do echo "${B}--- $(svc_label "$s")${N}"; tail -n 12 "$SHARE_DIR/$s.log" 2>/dev/null | cut -c1-200; done
+        for s in cris ireps; do echo "${B}--- $(svc_label "$s")${N}"; tail -n 12 "$SHARE_DIR/$s.log" 2>/dev/null | cut -c1-200; done
     fi
 }
 
 cmd_uninstall() {
     local purge=0 s; [ "${1:-}" = "--purge" ] && purge=1
     if have_systemd_user; then
-        systemctl --user disable --now railway-dsc-heal.timer eofficesigner-proxy.service crissigner.service irepssigner.service eofficesigner.service >/dev/null 2>&1
-        for s in $SVCS; do rm -f "$UNIT_DIR/$(svc_unit "$s").service"; done
+        # shellcheck disable=SC2046
+        systemctl --user disable --now $(unit_names) >/dev/null 2>&1
+        for s in $ALL_SVCS; do rm -f "$UNIT_DIR/$(svc_unit "$s").service"; done
         rm -f "$UNIT_DIR/railway-dsc-heal.service" "$UNIT_DIR/railway-dsc-heal.timer"
         systemctl --user daemon-reload
     else
         local p; p=$(cat "$STATE_DIR/supervisor.pid" 2>/dev/null); [ -n "$p" ] && kill "$p" 2>/dev/null
         for s in $SVCS; do svc_stop "$s"; done
     fi
-    rm -f "$AUTOSTART" "$BIN"; rm -rf "$SHARE_DIR"
-    ok "Services, watchdog and launchers removed."
+    rm -f "$AUTOSTART" "$BIN"
     if [ $purge = 1 ]; then
-        rm -rf "$CRIS_DIR" "$IREPS_DIR" "$PROXY_DIR" "$CONF_DIR"
-        rm -rf "$EOFFICE_DIR"/* 2>/dev/null
-        ok "Program files removed. Left in place (need root): $EOFFICE_DIR, $MTOKEN_LIB, $UDEV_RULE, the /etc/hosts line."
+        rm -rf "$SHARE_DIR" "$EOFFICE_DIR" "$CRIS_DIR" "$IREPS_DIR" "$CONF_DIR"
+        ok "Services and program files removed. Left in place (need root): $MTOKEN_LIB, $UDEV_RULE, the /etc/hosts line."
     else
-        info "Program files were kept. Remove them too with: uninstall --purge"
+        rm -rf "$KEEP_DIR" "$STATE_DIR" "$LAUNCH" "$PROBE"
+        ok "Services and watchdog removed; program files and Java runtimes kept (remove too with: uninstall --purge)."
     fi
 }
 
 usage() {
     cat <<EOF
-Railway DSC Signer Suite $SUITE_VERSION
+Railway DSC Signer Suite $SUITE_VERSION  -  eOffice (NIC $EOFFICE_VER), CrisSigner, IREPSSigner
 
-  pack [FILE]        build the portable installer (.run) from this working machine
-  install            install or repair everything; safe to run again at any time
-                       --ui-scale=N   window scale (1 normal, 2 HiDPI)
+  install | repair   install or repair everything; safe to run again at any time
+                       --msi=FILE     the official "Digital Signer Service 4.1.8_x64.msi"
+                                      (default: searched in ~/Downloads, ~/Desktop)
+                       --ui-scale=N   CRIS/IREPS window scale (1 normal, 2 HiDPI)
                        --no-root      skip the steps that need sudo
+                       --no-download  never download a Java runtime
+  doctor             explain every problem it can find and how to fix it
   status             health of all services, token and watchdog
   heal [--dry-run]   run the watchdog once now
   start|stop|restart control all signer services
   logs               recent watchdog actions and service logs
-  trust              re-add the local signer certificates to browser stores
+  trust              (re)add the local signer certificates to browser stores
+  pack [FILE]        build a portable installer (.run) from this working machine
   uninstall [--purge]
 EOF
 }
 
 main() {
     local cmd="${1:-help}"; [ $# -gt 0 ] && shift
+    case "$cmd" in supervise|help|-h|--help) ;; *) init_work_tmp;; esac
     case "$cmd" in
-        install)   cmd_install "$@";;
+        install|repair) cmd_install "$@";;
+        doctor)    cmd_doctor;;
         pack)      cmd_pack "$@";;
         status)    cmd_status;;
         heal)      cmd_heal "$@";;
