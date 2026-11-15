@@ -818,6 +818,7 @@ aa_block() {                  # the lines added to a viewer's local AppArmor fil
         "/sys/bus/usb/devices/ r," "/sys/devices/**/usb[0-9]*/** r," "/run/udev/data/c189:* r," "$AA_END"
 }
 aa_block_current() { [ "$(sed -n "\|^$AA_BEGIN\$|,\|^$AA_END\$|p" "/etc/apparmor.d/local/$1" 2>/dev/null)" = "$(aa_block)" ]; }
+aa_block_old() { grep -qsF "$AA_BEGIN" "/etc/apparmor.d/local/$1"; }      # present, but another version
 aa_rules_missing() {          # a viewer's AppArmor profile does not (yet, or not in this version) let it reach the token
     aa_enabled || return 1
     local p; for p in $(aa_viewer_profiles); do aa_block_current "$p" || { echo "$p"; return 0; }; done
@@ -1046,7 +1047,10 @@ EOF
                  ok "CCA India 2022 root trusted for signatures (DSC signatures show as trusted)" || warn "could not trust the CCA root"; fi
     else warn "NSS tools (certutil/modutil) missing - Document Viewer cannot see the token"; fi
     if v=$(pdf_viewer); then ok "PDF viewer with signing: $v"
-        p=$(aa_rules_missing) && warn "AppArmor still blocks the token in ${p#usr.bin.} (it would crash on signed PDFs) - run: railway-dsc install"
+        if p=$(aa_rules_missing); then
+            if aa_block_old "$p"; then warn "AppArmor rules for ${p#usr.bin.} are from an older suite version - run: railway-dsc install (asks for sudo)"
+            else warn "AppArmor still blocks the token in ${p#usr.bin.} (it would crash on signed PDFs) - run: railway-dsc install"; fi
+        fi
     else warn "no Document Viewer (papers/evince) installed - run: railway-dsc install"; fi
     return 0
 }
@@ -1663,7 +1667,8 @@ cmd_doctor() {
     if [ "${DSC_PDF:-yes}" = no ]; then d_ok "switched off (DSC_PDF=no in suite.conf)"
     else
         if o=$(pdf_viewer); then d_ok "Document Viewer: $o"; else d_warn "no PDF viewer that signs (papers/evince)"; d_fix "railway-dsc install"; fi
-        if o=$(aa_rules_missing); then d_fail "AppArmor blocks the token in ${o#usr.bin.}: it crashes when it opens a signed PDF"; d_fix "railway-dsc install   (adds the USB rules to /etc/apparmor.d/local/$o)"
+        if o=$(aa_rules_missing) && aa_block_old "$o"; then d_warn "AppArmor rules for ${o#usr.bin.} are from an older suite version (they work, but allow more than needed)"; d_fix "railway-dsc install   (asks for sudo)"
+        elif [ -n "$o" ]; then d_fail "AppArmor blocks the token in ${o#usr.bin.}: it crashes when it opens a signed PDF"; d_fix "railway-dsc install   (adds the USB rules to /etc/apparmor.d/local/$o)"
         elif aa_enabled && [ -n "$(aa_viewer_profiles)" ]; then d_ok "AppArmor lets the viewer use the token"; fi
         if pdf_py_ok && [ -x "$PDF_BIN" ]; then d_ok "sign-pdf ready ($PDF_BIN)"; else d_warn "sign-pdf not installed or pyHanko missing"; d_fix "railway-dsc install"; fi
         if j=$(find_p11_lib) && [ -n "$j" ]; then
