@@ -45,6 +45,10 @@ EOFFICE_VER="4.1.8"
 EOFFICE_JAR_NAME="DigitalSignerService4.1.8.jar"
 EOFFICE_JAR_SHA="a20f56ac01ff2ea5c548c94f05eb5e11900e9f34d31de2a999337e613251a300"
 EOFFICE_PORT=55101
+# SHA-256 of NIC's private "eOfficeCA2022" root (same in the 4.1.8 MSI's Pre-Requisites/eOfficeCA2022.cer
+# and in every 7.0.x package). Only a keystore whose chain ends in exactly this CA is accepted,
+# because that CA gets added to the browsers' trust stores.
+EOFFICE_CA_SHA256="28:D3:F3:52:E1:76:05:16:5C:BD:C2:75:EB:4C:63:B2:55:FF:63:88:AC:5A:A2:CE:1A:84:A0:97:D4:A3:E1:40"
 LEGACY_706_DIR="/usr/local/DigitalSignerService-7.0.6"
 VENDOR_HOOK="/etc/profile.d/DSC706-start.sh"
 MTOKEN_LIB="/usr/lib/libcryptoid_pkcs11.so"
@@ -174,6 +178,23 @@ jks_expiry() {                # $1 = jks (alias 1, password eoffice) -> epoch of
     [ -n "$end" ] && date -d "$end" +%s 2>/dev/null
 }
 jks_valid() { local e; e=$(jks_expiry "$1") && [ -n "$e" ] && [ "$e" -gt "$(date +%s)" ]; }
+jks_leaf_pem() {              # $1 = jks -> first certificate (the server's own) of alias 1 as PEM
+    local kt; kt=$(keytool_bin) || return 1
+    "$kt" -list -rfc -keystore "$1" -storepass eoffice -alias 1 2>/dev/null |
+        awk '/BEGIN CERTIFICATE/{on=1} on{print} /END CERTIFICATE/{exit}'
+}
+jks_trusted() {               # $1 = jks: chain ends in the pinned NIC CA and the leaf is for $HOSTS_NAME
+    have openssl || return 1
+    local d; d="$(work_tmp)/verify.$$"; mkdir -p "$d"
+    jks_ca_pem "$1" > "$d/ca.pem" && jks_leaf_pem "$1" > "$d/leaf.pem" || { rm -rf "$d"; return 1; }
+    local fp; fp=$(openssl x509 -in "$d/ca.pem" -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2)
+    if [ "$fp" = "$EOFFICE_CA_SHA256" ] &&
+       openssl verify -CAfile "$d/ca.pem" "$d/leaf.pem" >/dev/null 2>&1 &&
+       openssl x509 -in "$d/leaf.pem" -noout -ext subjectAltName 2>/dev/null | grep -q "DNS:$HOSTS_NAME"; then
+        rm -rf "$d"; return 0
+    fi
+    rm -rf "$d"; return 1
+}
 jks_ca_pem() {                # $1 = jks -> prints the last (CA) certificate of alias 1's chain as PEM
     local kt; kt=$(keytool_bin) || return 1
     "$kt" -list -rfc -keystore "$1" -storepass eoffice -alias 1 2>/dev/null |
@@ -515,7 +536,12 @@ pick_valid_jks() {            # prints a path to a currently valid dscSSL.jks
             zip) unzip -p "$f" '*/app/DigitalSignerService-7.0.*.jar' > "$t/in.jar" 2>/dev/null &&
                  unzip -p "$t/in.jar" BOOT-INF/classes/dscSSL.jks > "$t/dscSSL.jks" 2>/dev/null ;;
         esac
-        [ -s "$t/dscSSL.jks" ] && jks_valid "$t/dscSSL.jks" && { echo "$t/dscSSL.jks"; return 0; }
+        [ -s "$t/dscSSL.jks" ] || continue
+        if ! jks_trusted "$t/dscSSL.jks"; then
+            [ "$kind" = jks ] || warn "ignoring $f: its certificate is not issued by NIC's eOfficeCA2022 (fingerprint pinned)" >&2
+            continue
+        fi
+        jks_valid "$t/dscSSL.jks" && { echo "$t/dscSSL.jks"; return 0; }
     done < <(renewed_jks_candidates)
     return 1
 }
@@ -698,6 +724,9 @@ trust_certs() {
         while IFS= read -r item; do
             name="${item%%|*}"; file="${item#*|}"; file="${file%%|*}"; flags="${item##*|}"
             [ -f "$file" ] || continue
+            if [ "$name" = eOfficeCA2022 ] && [ "$(cert_fp "$file")" != "$EOFFICE_CA_SHA256" ]; then
+                warn "not trusting $file: it is not NIC's eOfficeCA2022 (fingerprint mismatch)"; continue
+            fi
             if certutil -d "sql:$d" -L -n "$name" >/dev/null 2>&1; then certutil -d "sql:$d" -M -n "$name" -t "$flags" 2>/dev/null
             elif cert_in_db "$d" "$file" "$name"; then :      # already trusted under another nickname
             else certutil -d "sql:$d" -A -n "$name" -t "$flags" -i "$file" 2>/dev/null || warn "could not add '$name' to $d"; fi
@@ -721,6 +750,7 @@ install_eoffice_files() {
     [ "$(sha "$jar")" = "$EOFFICE_JAR_SHA" ] || die "$jar is not the expected NIC 4.1.8 build (checksum mismatch)"
     mkdir -p "$EOFFICE_DIR" "$EOFFICE_LOGS"
     [ "$jar" = "$EOFFICE_JAR" ] || copy_if_changed "$jar" "$EOFFICE_JAR" 644
+    have openssl || die "openssl is needed to verify NIC's certificate (Ubuntu: sudo apt install openssl)"
     jks=$(pick_valid_jks) || die "No currently valid HTTPS certificate for $HOSTS_NAME found. The one inside 4.1.8 expired on 21-06-2026; keep NIC's 7.0.x Linux installer zip in ~/Downloads (it carries the renewed certificate) and run install again."
     copy_if_changed "$jks" "$EOFFICE_JKS" 600
     jks_ca_pem "$EOFFICE_JKS" > "$EOFFICE_CA.new" && [ -s "$EOFFICE_CA.new" ] && copy_if_changed "$EOFFICE_CA.new" "$EOFFICE_CA" 644; rm -f "$EOFFICE_CA.new"
