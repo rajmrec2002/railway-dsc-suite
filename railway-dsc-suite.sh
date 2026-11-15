@@ -34,7 +34,7 @@
 set -u
 set -o pipefail
 
-SUITE_VERSION="4.4.0"
+SUITE_VERSION="4.5.0"
 MARKER="__PAYLOAD_BELOW__"
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
 
@@ -85,6 +85,7 @@ set_user_paths() {            # $1 = home directory
     MANIFEST="$SHARE_DIR/manifest.sha256"
     LAUNCH="$SHARE_DIR/launch.sh"
     LAF_JAR="$SHARE_DIR/laf-gtk.jar"
+    SCALE_JAR="$SHARE_DIR/swing-scale.jar"
     KIT_COPY="$SHARE_DIR/kit"
     PROBE="$SHARE_DIR/probe.py"
     HEAL_LOG="$SHARE_DIR/heal.log"
@@ -393,6 +394,16 @@ write_laf_jar() {
         mv -f "$LAF_JAR.tmp" "$LAF_JAR" || { rm -f "$LAF_JAR.tmp"; warn "could not write the GTK look jar"; }
 }
 
+# Java 8 cannot scale Swing on Linux; this agent (source: extras/swing-scale/) enlarges the
+# eOffice 4.1.8 windows (PIN prompt, start message) when they open. NIC's jar is not changed.
+SCALE_JAR_SHA="6fac7ea8d7e656e2ab9ae15a8aedb532c70d71d534a9317218c10ccdeaccd416"
+SCALE_JAR_B64="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"
+write_scale_jar() {
+    mkdir -p "$SHARE_DIR"
+    printf '%s' "$SCALE_JAR_B64" | base64 -d > "$SCALE_JAR.tmp" && [ "$(sha "$SCALE_JAR.tmp")" = "$SCALE_JAR_SHA" ] &&
+        mv -f "$SCALE_JAR.tmp" "$SCALE_JAR" || { rm -f "$SCALE_JAR.tmp"; warn "could not write the window-scaling agent"; }
+}
+
 write_launcher() {
     mkdir -p "$SHARE_DIR"
     {
@@ -400,7 +411,7 @@ write_launcher() {
         echo "# Generated by railway-dsc-suite $SUITE_VERSION - do not edit; re-run \"railway-dsc install\"."
         echo '# usage: launch.sh eoffice|cris|ireps'
         local v
-        for v in U_HOME LAF_JAR E7_DIR E7_JAR E7_LOGS EOFFICE_DIR EOFFICE_JAR EOFFICE_JKS EOFFICE_LOGS CRIS_DIR IREPS_DIR CONF_FILE \
+        for v in U_HOME LAF_JAR SCALE_JAR E7_DIR E7_JAR E7_LOGS EOFFICE_DIR EOFFICE_JAR EOFFICE_JKS EOFFICE_LOGS CRIS_DIR IREPS_DIR CONF_FILE \
                  JRE8_DIR JRE17_DIR LEGACY_706_DIR HOSTS_NAME P11_CANDIDATES OPENSC_LIBS MTOKEN_LIB; do
             printf '%s=%q\n' "$v" "${!v}"
         done
@@ -408,7 +419,7 @@ write_launcher() {
     } > "$LAUNCH"
     cat >> "$LAUNCH" <<'LAUNCH_EOF'
 SVC="${1:-}"
-DSC_UI_SCALE=auto; DSC_LOOK=native; P11_LIB=""; JAVA8=""; JAVA17=""
+DSC_UI_SCALE=auto; DSC_EOFFICE_SCALE=auto; DSC_LOOK=native; P11_LIB=""; JAVA8=""; JAVA17=""
 [ -f "$CONF_FILE" ] && . "$CONF_FILE"
 
 # --- Display: these are Swing apps and the PIN prompt needs an X display -------
@@ -482,8 +493,11 @@ if [ "$SVC" = eoffice ]; then
         printf 'name = DSCToken\nlibrary = %s\n' "$P11" > pkcs11cfg
     fi
     exec >>"$EOFFICE_LOGS/output.log" 2>>"$EOFFICE_LOGS/error.log"
-    # Java 8 cannot scale Swing on Linux; NIC's PIN window keeps its fixed pixel size.
-    exec "$J8" "$NOATK" -jar "$EOFFICE_JAR" \
+    # Java 8 cannot scale Swing on Linux: the scaling agent enlarges NIC's PIN window instead.
+    case "$DSC_EOFFICE_SCALE" in ""|auto) ES="$DSC_UI_SCALE";; *) ES="$DSC_EOFFICE_SCALE";; esac
+    AGENT=()
+    if [ -f "$SCALE_JAR" ] && awk -v s="$ES" 'BEGIN{exit !(s+0 > 1.01)}'; then AGENT=("-javaagent:$SCALE_JAR=$ES"); fi
+    exec "$J8" "$NOATK" "${AGENT[@]}" -jar "$EOFFICE_JAR" \
         --server.ssl.key-store="file:$EOFFICE_JKS" --server.address="$BIND"
 fi
 
@@ -570,7 +584,7 @@ keep_list() {
     local f
     for f in "$EOFFICE_JAR" "$EOFFICE_JKS" "$EOFFICE_CA" "$E7_JAR"; do echo "$f"; done
     find "$CRIS_DIR" "$IREPS_DIR" -maxdepth 2 -type f \( -name '*.jar' -o -name 'certificate.crt' \) 2>/dev/null
-    echo "$LAUNCH"; echo "$PROBE"; echo "$LAF_JAR"
+    echo "$LAUNCH"; echo "$PROBE"; echo "$LAF_JAR"; echo "$SCALE_JAR"
 }
 refresh_keep() {
     rm -rf "$KEEP_DIR"; mkdir -p "$KEEP_DIR"; chmod 700 "$KEEP_DIR"; : > "$MANIFEST.tmp"
@@ -1034,10 +1048,10 @@ ask_eoffice() {               # interactive choice when nothing was chosen yet
 }
 
 cmd_install() {
-    local no_root=0 ui_scale="" a opt_eoffice=""
+    local no_root=0 ui_scale="" pin_scale="" a opt_eoffice=""
     OPT_MSI=""; OPT_ZIP7=""; OPT_DOWNLOAD=1; OPT_CRIS_MSI=""; OPT_IREPS_MSI=""; OPT_KIT=""; OPT_EPASS_ZIP=""
     for a in "$@"; do case "$a" in
-        --no-root) no_root=1;; --ui-scale=*) ui_scale="${a#*=}";;
+        --no-root) no_root=1;; --ui-scale=*) ui_scale="${a#*=}";; --pin-scale=*) pin_scale="${a#*=}";;
         --msi=*) OPT_MSI="${a#*=}";; --zip7=*) OPT_ZIP7="${a#*=}";; --no-download) OPT_DOWNLOAD=0;;
         --cris-msi=*) OPT_CRIS_MSI="${a#*=}";; --ireps-msi=*) OPT_IREPS_MSI="${a#*=}";; --kit=*) OPT_KIT="${a#*=}";;
         --epass-zip=*) OPT_EPASS_ZIP="${a#*=}";;
@@ -1106,8 +1120,9 @@ cmd_install() {
         cat > "$CONF_FILE" <<EOF
 # Railway DSC Signer Suite settings.  After editing:  railway-dsc install
 # Size of the CRIS/IREPS windows: auto = follow the desktop, or a number (1, 1.5, 2).
-# (The eOffice PIN window runs on Java 8, which cannot scale on Linux.)
 DSC_UI_SCALE=${ui_scale:-auto}
+# Size of the eOffice 4.1.8 PIN window: auto = same as above, or a number (1.5 = 150%).
+DSC_EOFFICE_SCALE=${pin_scale:-auto}
 # Look of the CRIS/IREPS windows: native = desktop GTK theme, metal = Java default.
 DSC_LOOK=native
 # eOffice signer version(s): 4 (= 4.1.8, port 55101), 7 (= 7.0.6, port 55103) or both
@@ -1118,7 +1133,10 @@ P11_LIB=""
 JAVA8=""
 JAVA17=""
 EOF
-    elif [ -n "$ui_scale" ]; then sed -i "s/^DSC_UI_SCALE=.*/DSC_UI_SCALE=$ui_scale/" "$CONF_FILE"; fi
+    else
+        [ -n "$ui_scale" ] && conf_set DSC_UI_SCALE "$ui_scale"
+        [ -n "$pin_scale" ] && conf_set DSC_EOFFICE_SCALE "$pin_scale"
+    fi
     conf_set DSC_EOFFICE "$DSC_EOFFICE"
     # shellcheck disable=SC1090
     . "$CONF_FILE"
@@ -1141,7 +1159,7 @@ EOF
             info "Previous $u.service saved in $prev"
         fi
     done
-    write_probe; write_laf_jar; write_launcher; install_self
+    write_probe; write_laf_jar; write_scale_jar; write_launcher; install_self
     if [ "${RDSC_TEST_NOSTART:-}" = 1 ]; then
         write_units; info "(test mode: services not enabled or started)"
     elif have_systemd_user; then
@@ -1580,7 +1598,8 @@ Railway DSC Signer Suite $SUITE_VERSION  -  eOffice (NIC $EOFFICE_VER and/or $E7
                        --cris-msi=FILE, --ireps-msi=FILE   the vendors' Windows installers
                                       (default: searched in ~/Downloads); CRIS/IREPS are
                                       built from them with the Linux patch kit (kit/)
-                       --ui-scale=N   CRIS/IREPS window scale (default auto = like the desktop)
+                       --ui-scale=N   CRIS/IREPS/7.0.6 window scale (default auto = like the desktop)
+                       --pin-scale=N  eOffice 4.1.8 PIN window scale, e.g. 1.5 = 150% (default auto)
                        --no-root      skip the steps that need sudo
                        --no-download  never download a Java runtime
   doctor             explain every problem it can find and how to fix it

@@ -152,8 +152,11 @@ NIC's jar is never modified. Everything is done around it:
   native apps.
 - To change this, edit `~/.config/railway-dsc/suite.conf` (`DSC_UI_SCALE=2`,
   `DSC_LOOK=metal`) and run `railway-dsc install`.
-- **The eOffice PIN window** runs on Java 8, which cannot scale Swing on Linux, so it
-  keeps NIC's fixed pixel size. It is small on HiDPI screens but works.
+- **The eOffice 4.1.8 PIN window** runs on Java 8, which cannot scale Swing on Linux.
+  A small agent of the suite (`-javaagent`, source in `extras/swing-scale/`) enlarges
+  its windows as they open: fonts, fixed-position fields and window size. NIC's jar is
+  not changed. The size follows the desktop by default; choose your own with
+  `railway-dsc install --pin-scale=1.5` (150%), or `DSC_EOFFICE_SCALE` in suite.conf.
 
 ## Self-healing
 
