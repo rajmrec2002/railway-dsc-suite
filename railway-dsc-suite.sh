@@ -34,7 +34,7 @@
 set -u
 set -o pipefail
 
-SUITE_VERSION="4.2.0"
+SUITE_VERSION="4.3.0"
 MARKER="__PAYLOAD_BELOW__"
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
 
@@ -85,6 +85,7 @@ set_user_paths() {            # $1 = home directory
     MANIFEST="$SHARE_DIR/manifest.sha256"
     LAUNCH="$SHARE_DIR/launch.sh"
     LAF_JAR="$SHARE_DIR/laf-gtk.jar"
+    KIT_COPY="$SHARE_DIR/kit"
     PROBE="$SHARE_DIR/probe.py"
     HEAL_LOG="$SHARE_DIR/heal.log"
     BIN="$U_HOME/.local/bin/railway-dsc"
@@ -579,7 +580,13 @@ locate_payload() {
 # ----------------------------------------------------- eOffice file sources ---
 find_msi() {                  # the official Windows installer of the 4.1.8 signer
     [ -n "${OPT_MSI:-}" ] && { [ -f "$OPT_MSI" ] && echo "$OPT_MSI"; return; }
-    find "$U_HOME/Downloads" "$U_HOME/Desktop" "$U_HOME" -maxdepth 5 -type f -iname '*signer*4.1.8*.msi' 2>/dev/null | head -1
+    local d f
+    for d in "$U_HOME/Downloads" "$U_HOME/Desktop" "$U_HOME"; do      # missing folders must not abort the search
+        [ -d "$d" ] || continue
+        f=$(find "$d" -maxdepth 5 -type f -iname '*signer*4.1.8*.msi' -print -quit 2>/dev/null || true)
+        [ -n "$f" ] && { echo "$f"; return 0; }
+    done
+    return 1
 }
 jar_from_msi() {              # $1 = msi -> path of the verified jar (in a temp dir)
     have cabextract || return 1
@@ -881,6 +888,40 @@ install_eoffice7_files() {
     ok "eOffice signer $E7_VER in $E7_DIR (port $E7_PORT)"
 }
 
+# ---- CRIS/IREPS from the vendors' Windows installers + the Linux patch kit (kit/) ----
+kit_dir() {                   # the kit shipped next to this script, or the copy kept by an earlier install
+    local k
+    for k in "${OPT_KIT:-}" "$(dirname "$SELF")/kit" "$KIT_COPY"; do
+        [ -n "$k" ] && [ -f "$k/kittool.py" ] && [ -f "$k/cris/recipe.json" ] && { echo "$k"; return 0; }
+    done
+    return 1
+}
+recipe_val() { python3 -I -c 'import json,sys; v=json.load(open(sys.argv[1])).get(sys.argv[2]); print(v or "")' "$1" "$2" 2>/dev/null; }
+find_vendor_msi() {           # $1 = expected sha256  $2 = name pattern  [$3 = explicit file]
+    local f
+    [ -n "${3:-}" ] && { [ "$(sha "$3")" = "$1" ] && echo "$3"; return; }
+    while IFS= read -r f; do [ "$(sha "$f")" = "$1" ] && { echo "$f"; return 0; }; done < <(
+        find "$U_HOME/Downloads" "$U_HOME/Desktop" -maxdepth 4 -type f -iname "$2" 2>/dev/null)
+    return 1
+}
+install_from_kit() {          # $1 = cris|ireps  $2 = destination
+    local d="$1" dst="$2" k rec msi aux="" args=()
+    k=$(kit_dir) || { warn "$(svc_label "$d"): not installed, and the Linux patch kit (kit/ next to this script) was not found"; return 1; }
+    have cabextract || { warn "$(svc_label "$d"): cabextract is needed to unpack the vendor installer (Ubuntu: sudo apt install cabextract)"; return 1; }
+    rec="$k/$d/recipe.json"
+    local pat='CrisSigner*.msi' opt="${OPT_CRIS_MSI:-}"; [ "$d" = ireps ] && { pat='IREPSSigner*.msi'; opt="${OPT_IREPS_MSI:-}"; }
+    msi=$(find_vendor_msi "$(recipe_val "$rec" msi_sha256)" "$pat" "$opt") ||
+        { warn "$(svc_label "$d"): put the vendor installer '$(recipe_val "$rec" msi_name)' (the exact version the kit was made for) in ~/Downloads"; return 1; }
+    [ -n "$(recipe_val "$rec" aux_msi_sha256)" ] && aux=$(find_vendor_msi "$(recipe_val "$rec" aux_msi_sha256)" 'IREPSSigner*.msi' "${OPT_IREPS_MSI:-}" || true)
+    [ -n "$aux" ] && args+=(--aux-msi "$aux")
+    [ "${OPT_DOWNLOAD:-1}" = 1 ] || args+=(--offline)
+    info "Building $(svc_label "$d") from $(basename "$msi")${aux:+ + $(basename "$aux")} and the Linux patch kit ..."
+    python3 -I "$k/kittool.py" apply --kit "$k/$d" --msi "$msi" "${args[@]}" --dest "$dst" 2>&1 | sed 's/^/    /'
+    [ "${PIPESTATUS[0]}" = 0 ] || { warn "$(svc_label "$d"): building from the installer failed"; return 1; }
+    if [ "$k" != "$KIT_COPY" ]; then rm -rf "$KIT_COPY.tmp"; cp -a "$k" "$KIT_COPY.tmp" && rm -rf "$KIT_COPY" && mv "$KIT_COPY.tmp" "$KIT_COPY"; fi
+    CHANGED=1
+}
+
 install_app_files() {         # $1 = cris|ireps
     local d="$1" dst="$CRIS_DIR" f rel
     [ "$d" = ireps ] && dst="$IREPS_DIR"
@@ -895,7 +936,8 @@ install_app_files() {         # $1 = cris|ireps
         done < <(find "$PAYLOAD/$d" \( -type f -o -type l \))
         ok "$(svc_label "$d") files in $dst"
     elif svc_files_ok "$d"; then ok "$(svc_label "$d") already installed in $dst"
-    else warn "$(svc_label "$d"): not installed and not in the payload - skipped"; fi
+    elif install_from_kit "$d" "$dst"; then ok "$(svc_label "$d") installed in $dst (vendor installer + Linux patch kit)"
+    else warn "$(svc_label "$d"): skipped"; fi
 }
 install_runtime() {           # $1 = 8|17
     local v="$1" dir="$JRE8_DIR" finder=find_java8
@@ -943,10 +985,11 @@ ask_eoffice() {               # interactive choice when nothing was chosen yet
 
 cmd_install() {
     local no_root=0 ui_scale="" a opt_eoffice=""
-    OPT_MSI=""; OPT_ZIP7=""; OPT_DOWNLOAD=1
+    OPT_MSI=""; OPT_ZIP7=""; OPT_DOWNLOAD=1; OPT_CRIS_MSI=""; OPT_IREPS_MSI=""; OPT_KIT=""
     for a in "$@"; do case "$a" in
         --no-root) no_root=1;; --ui-scale=*) ui_scale="${a#*=}";;
         --msi=*) OPT_MSI="${a#*=}";; --zip7=*) OPT_ZIP7="${a#*=}";; --no-download) OPT_DOWNLOAD=0;;
+        --cris-msi=*) OPT_CRIS_MSI="${a#*=}";; --ireps-msi=*) OPT_IREPS_MSI="${a#*=}";; --kit=*) OPT_KIT="${a#*=}";;
         --eoffice=*) opt_eoffice="${a#*=}"
             case "$opt_eoffice" in 4|4.1*|7|7.0*|both|all) ;; *) die "--eoffice must be 4, 7 or both";; esac;;
         *) die "unknown option $a";; esac; done
@@ -965,7 +1008,8 @@ cmd_install() {
     local nj8=0 nj17=0 ncab=0 reasons=()
     if svc_wanted eoffice && ! find_java8 >/dev/null && ! { [ -n "$PAYLOAD" ] && [ -x "$PAYLOAD/jre8/bin/java" ]; }; then nj8=1; reasons+=("Java 8 runtime"); fi
     if ! find_java_modern >/dev/null && ! { [ -n "$PAYLOAD" ] && [ -x "$PAYLOAD/jre17/bin/java" ]; }; then nj17=1; reasons+=("Java 17 runtime"); fi
-    if svc_wanted eoffice && ! { [ -n "$PAYLOAD" ] && [ -f "$PAYLOAD/eoffice/$EOFFICE_JAR_NAME" ]; } && [ ! -f "$EOFFICE_JAR" ] && ! have cabextract; then ncab=1; reasons+=("cabextract"); fi
+    local kit_needed=0; for a in cris ireps; do { [ -n "$PAYLOAD" ] && [ -d "$PAYLOAD/$a" ]; } || svc_files_ok "$a" || kit_needed=1; done
+    if ! have cabextract && { [ $kit_needed = 1 ] || { svc_wanted eoffice && ! { [ -n "$PAYLOAD" ] && [ -f "$PAYLOAD/eoffice/$EOFFICE_JAR_NAME" ]; } && [ ! -f "$EOFFICE_JAR" ]; }; }; then ncab=1; reasons+=("cabextract"); fi
     have python3 || reasons+=("python3")
     have certutil || reasons+=("certutil (NSS tools)")
     have unzip || reasons+=("unzip")
@@ -1455,6 +1499,9 @@ Railway DSC Signer Suite $SUITE_VERSION  -  eOffice (NIC $EOFFICE_VER and/or $E7
                        --msi=FILE     the official "Digital Signer Service 4.1.8_x64.msi"
                                       (default: searched in ~/Downloads, ~/Desktop)
                        --zip7=FILE    NIC's "DigitalSignerService_7.0.6_Ubuntu_Installer.zip"
+                       --cris-msi=FILE, --ireps-msi=FILE   the vendors' Windows installers
+                                      (default: searched in ~/Downloads); CRIS/IREPS are
+                                      built from them with the Linux patch kit (kit/)
                        --ui-scale=N   CRIS/IREPS window scale (default auto = like the desktop)
                        --no-root      skip the steps that need sudo
                        --no-download  never download a Java runtime

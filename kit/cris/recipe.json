@@ -1,0 +1,192 @@
+{
+ "app": "cris",
+ "aux_msi_name": "IREPSSigner(1).msi",
+ "aux_msi_sha256": "1969e090f462b59a1502a6809a8f74d9be9f03ea9b43e83f83e6022f5de3d675",
+ "files": {
+  "certificate.crt": {
+   "sha256": "875777c20fcd5635837615260d971f02bbe5cb03a000ca249ed432f79d016be2",
+   "source": "msi:certificate.crt"
+  },
+  "lib/BrowseApp.jar": {
+   "sha256": "781186512caf16c98e8c679e3b76400a16803f56ecbb11394b8a9422cd2dffbb",
+   "source": "msi:BrowseApp.jar"
+  },
+  "lib/PKIServer.jar": {
+   "sha256": "ead4346fba9be833997f01bae39ff5cf03bd0666fc879b743903f2e4970fe20b",
+   "source": "msi:PKIServer.jar"
+  },
+  "lib/activation1.1.jar": {
+   "sha256": "2881c79c9d6ef01c58e62beea13e9d1ac8b8baa16f2fc198ad6e6776defdcdd3",
+   "source": "msi:activation1.1.jar"
+  },
+  "lib/bcmailjdk16143.jar": {
+   "sha256": "9e93b97e2d7f6b156ee04005c81a543876c10bea82481a6bc19cc0efaa4f4835",
+   "source": "msi:bcmailjdk16143.jar"
+  },
+  "lib/bcprovjdk16143.jar": {
+   "sha256": "2542d786abf0204a5a3874e6c2faa81ba2ff21ff59b2440dd6bf33ed7d8ce205",
+   "source": "msi:bcprovjdk16143.jar"
+  },
+  "lib/bcprovjdk18on1.78.1.jar": {
+   "sha256": "add5915e6acfc6ab5836e1fd8a5e21c6488536a8c1f21f386eeb3bf280b702d7",
+   "source": "msi:bcprovjdk18on1.78.1.jar"
+  },
+  "lib/bctspjdk161.44.jar": {
+   "sha256": "affece91f452edd0b11238d2719d3623d6d07b46205796a861a390b1e184d5ee",
+   "source": "msi:bctspjdk161.44.jar"
+  },
+  "lib/certviewer.jar": {
+   "sha256": "7bea898eb74db529f32edf5d14e18b7779930ffd6440a2bc7158fa2fa52a3a74",
+   "source": "msi:certviewer.jar"
+  },
+  "lib/certviewerout.jar": {
+   "sha256": "9d2b4bc94c41caa530d50a9cae6d134a75aa4dab6759933af235dbd4db018b1b",
+   "source": "msi:certviewerout.jar"
+  },
+  "lib/commonscodec1.4.jar": {
+   "sha256": "6aa4234c74f3a1035751a25822545867c8c3727125a642b6e049665d1863631b",
+   "source": "msi:commonscodec1.4.jar"
+  },
+  "lib/io-7.1.12.jar": {
+   "maven": "https://repo1.maven.org/maven2/com/itextpdf/io/7.1.12/io-7.1.12.jar",
+   "sha256": "750627f1e9f23fc47ffc78fe5a276d57745090243194104c5ce0e9cb0966e241",
+   "source": "aux:io7.1.12.jar"
+  },
+  "lib/io7.1.12.jar": {
+   "maven": "https://repo1.maven.org/maven2/com/itextpdf/io/7.1.12/io-7.1.12.jar",
+   "sha256": "750627f1e9f23fc47ffc78fe5a276d57745090243194104c5ce0e9cb0966e241",
+   "source": "aux:io7.1.12.jar"
+  },
+  "lib/jna-5.14.0.jar": {
+   "maven": "https://repo1.maven.org/maven2/net/java/dev/jna/jna/5.14.0/jna-5.14.0.jar",
+   "sha256": "34ed1e1f27fa896bca50dbc4e99cf3732967cec387a7a0d5e3486c09673fe8c6",
+   "source": "aux:jna5.14.0.jar"
+  },
+  "lib/jna4.2.2.jar": {
+   "sha256": "1f38af54e06c6e6f6dbf39ba2c052b952dea5dddb4871127b34639ddeb11bdbe",
+   "source": "msi:jna4.2.2.jar"
+  },
+  "lib/jna5.14.0.jar": {
+   "maven": "https://repo1.maven.org/maven2/net/java/dev/jna/jna/5.14.0/jna-5.14.0.jar",
+   "sha256": "34ed1e1f27fa896bca50dbc4e99cf3732967cec387a7a0d5e3486c09673fe8c6",
+   "source": "aux:jna5.14.0.jar"
+  },
+  "lib/jxl.jar": {
+   "sha256": "c5c53645ab751288398f30adaec5551879c5ee334d4862ea77b25a386646621c",
+   "source": "msi:jxl.jar"
+  },
+  "lib/kernel-7.1.12.jar": {
+   "maven": "https://repo1.maven.org/maven2/com/itextpdf/kernel/7.1.12/kernel-7.1.12.jar",
+   "sha256": "9bdebe5ab84ff092de29032e336fdd841c81f1bb0002c483b94f2afd8217513a",
+   "source": "aux:kernel7.1.12.jar"
+  },
+  "lib/kernel7.1.12.jar": {
+   "maven": "https://repo1.maven.org/maven2/com/itextpdf/kernel/7.1.12/kernel-7.1.12.jar",
+   "sha256": "9bdebe5ab84ff092de29032e336fdd841c81f1bb0002c483b94f2afd8217513a",
+   "source": "aux:kernel7.1.12.jar"
+  },
+  "lib/layout-7.1.12.jar": {
+   "maven": "https://repo1.maven.org/maven2/com/itextpdf/layout/7.1.12/layout-7.1.12.jar",
+   "sha256": "450d1d03e18a84d860bbccb23a88567c3d3f5d00cfd3f003c7107319b6b32486",
+   "source": "aux:layout7.1.12.jar"
+  },
+  "lib/layout7.1.12.jar": {
+   "maven": "https://repo1.maven.org/maven2/com/itextpdf/layout/7.1.12/layout-7.1.12.jar",
+   "sha256": "450d1d03e18a84d860bbccb23a88567c3d3f5d00cfd3f003c7107319b6b32486",
+   "source": "aux:layout7.1.12.jar"
+  },
+  "lib/log4j1.2.15.jar": {
+   "sha256": "9f5f5799707881451a39c1b2dd22b4e43b97a80698db7daf1c9697f545e24387",
+   "source": "msi:log4j1.2.15.jar"
+  },
+  "lib/mail1.4.1.jar": {
+   "sha256": "294f0b3fbc55e0fcf7b20370a57846f5d7edf9f5cfa7dfaea01eb1aad178eac3",
+   "source": "msi:mail1.4.1.jar"
+  },
+  "lib/plugin.jar": {
+   "optional": true,
+   "sha256": "b219307dec5372a799c3a96e9b1576bc61352ccf41a5c6af6261e2baf6c2c29c",
+   "source": "aux:plugin.jar"
+  },
+  "lib/poi-3.7-20101029.jar": {
+   "maven": "https://repo1.maven.org/maven2/org/apache/poi/poi/3.7/poi-3.7.jar",
+   "sha256": "e0ba612de4e316aeaf830c1ba9ae2f8f828dc7ae60eeb891932cd2ce40da24d3",
+   "source": "aux:poi3.720101029.jar"
+  },
+  "lib/poi2.5.1final20040804.jar": {
+   "sha256": "e48109ae5e38a86de2a4d47323e78fb33f98a5f0175cc8dd65a28dbde97c4a84",
+   "source": "msi:poi2.5.1final20040804.jar"
+  },
+  "lib/poi3.720101029.jar": {
+   "maven": "https://repo1.maven.org/maven2/org/apache/poi/poi/3.7/poi-3.7.jar",
+   "sha256": "e0ba612de4e316aeaf830c1ba9ae2f8f828dc7ae60eeb891932cd2ce40da24d3",
+   "source": "aux:poi3.720101029.jar"
+  },
+  "lib/propkcs7certviewerout.jar": {
+   "sha256": "f5b73d18f0503a8ae8c3bf6c0ede8d27a53445b47b220025d7e6b8152ab00e2b",
+   "source": "msi:propkcs7certviewerout.jar"
+  },
+  "lib/slf4j-api-1.7.13.jar": {
+   "maven": "https://repo1.maven.org/maven2/org/slf4j/slf4j-api/1.7.13/slf4j-api-1.7.13.jar",
+   "sha256": "20d68d0c2e4fb984ffc164852b8b68df49a2b8716076f576881bcef7649a0e35",
+   "source": "aux:slf4japi1.7.13.jar"
+  },
+  "lib/slf4japi1.7.13.jar": {
+   "maven": "https://repo1.maven.org/maven2/org/slf4j/slf4j-api/1.7.13/slf4j-api-1.7.13.jar",
+   "sha256": "20d68d0c2e4fb984ffc164852b8b68df49a2b8716076f576881bcef7649a0e35",
+   "source": "aux:slf4japi1.7.13.jar"
+  },
+  "lib/sunmscapi.jar": {
+   "sha256": "f11c166d0251a38a09d8f8024902702d96595e5321282f6d66f00609c6de777e",
+   "source": "aux:sunmscapi.jar",
+   "stub": "sunmscapi-stub.jar"
+  },
+  "lib/swinglayout1.0.4.jar": {
+   "sha256": "143e5551c32934263260412c1d5f4e327fe186b8a5512c0db16ef2e3ed022cad",
+   "source": "msi:swinglayout1.0.4.jar"
+  },
+  "lib/windows-laf-stub.jar": {
+   "sha256": "03107ef6a65005113be51382eaa07874199d85907a0a9b86307502a5502fa28d",
+   "source": "kit:windows-laf-stub.jar"
+  },
+  "lib/windowslookandfell-stub.jar": {
+   "sha256": "03107ef6a65005113be51382eaa07874199d85907a0a9b86307502a5502fa28d",
+   "source": "kit:windowslookandfell-stub.jar"
+  }
+ },
+ "jars": {
+  "crissigner_app.jar": {
+   "digest": "c46e023b52e121c09f1256c2d7dcd16923951063a18abda9365583f41e164319",
+   "overlay": "CrisSigner.exe.overlay.zip",
+   "removed": [],
+   "source": "exe:CrisSigner.exe"
+  },
+  "lib/docsigner4.4_Cris.jar": {
+   "digest": "f460df2b886bde8f1fca05e408f3014f12f0eb058713a68467e6ef00144c333a",
+   "overlay": "docsigner4.4_Cris.jar.overlay.zip",
+   "removed": [],
+   "source": "msi:docsigner4.4_Cris.jar"
+  },
+  "lib/pdfwebsigner4.5_CRIS.jar": {
+   "digest": "314777942098f3c8ebc33ea0252232cb777eae4a37c6c63458b02befdcbea2e5",
+   "overlay": "pdfwebsigner4.5_CRIS.jar.overlay.zip",
+   "removed": [],
+   "source": "msi:pdfwebsigner4.5_CRIS.jar"
+  }
+ },
+ "links": {
+  "lib/activation-1.1.jar": "activation1.1.jar",
+  "lib/bcmail-jdk16-143.jar": "bcmailjdk16143.jar",
+  "lib/bcprov-jdk16-143.jar": "bcprovjdk16143.jar",
+  "lib/bcprov-jdk18on-1.78.1.jar": "bcprovjdk18on1.78.1.jar",
+  "lib/bctsp-jdk16-1.44.jar": "bctspjdk161.44.jar",
+  "lib/commons-codec-1.4.jar": "commonscodec1.4.jar",
+  "lib/jna-4.2.2.jar": "jna4.2.2.jar",
+  "lib/log4j-1.2.15.jar": "log4j1.2.15.jar",
+  "lib/mail-1.4.1.jar": "mail1.4.1.jar",
+  "lib/poi-2.5.1-final-20040804.jar": "poi2.5.1final20040804.jar",
+  "lib/swing-layout-1.0.4.jar": "swinglayout1.0.4.jar"
+ },
+ "msi_name": "CrisSigner.msi",
+ "msi_sha256": "aaa1c7aab92304ad0c0985add3561902fef2d6abf46e4ed602e8f8f8b339b442"
+}
