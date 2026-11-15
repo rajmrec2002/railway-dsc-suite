@@ -3,12 +3,15 @@ package railwaydsc;
 import java.awt.AWTEvent;
 import java.awt.Component;
 import java.awt.Container;
+import java.awt.Dialog;
 import java.awt.Dimension;
 import java.awt.Font;
+import java.awt.Frame;
 import java.awt.Rectangle;
 import java.awt.Toolkit;
 import java.awt.Window;
 import java.awt.event.AWTEventListener;
+import java.awt.event.HierarchyEvent;
 import java.awt.event.WindowEvent;
 import java.lang.instrument.Instrumentation;
 import java.util.Collections;
@@ -46,6 +49,19 @@ public final class SwingScaleAgent {
         if (factor <= 1.01f || factor > 4f) return;
         if (java.awt.GraphicsEnvironment.isHeadless()) return;
         try {
+            /* Before the window is mapped: its native peer has just been made (setVisible -> addNotify) but the
+               window manager has not seen it yet, so the larger size counts even for a NOT RESIZABLE window
+               (GNOME/mutter ignores a later resize of one: NIC's PIN window stayed 280x165 with 1.5x contents). */
+            Toolkit.getDefaultToolkit().addAWTEventListener(new AWTEventListener() {
+                @Override public void eventDispatched(AWTEvent e) {
+                    if (!(e instanceof HierarchyEvent) || !(e.getSource() instanceof Window)) return;
+                    HierarchyEvent h = (HierarchyEvent) e;
+                    Window w = (Window) e.getSource();
+                    if (h.getChanged() == w && (h.getChangeFlags() & HierarchyEvent.DISPLAYABILITY_CHANGED) != 0
+                            && w.isDisplayable() && !w.isShowing()) scaleWindow(w);
+                }
+            }, AWTEvent.HIERARCHY_EVENT_MASK);
+            /* Fallback, after it opened (a window shown in a way the event above missed) */
             Toolkit.getDefaultToolkit().addAWTEventListener(new AWTEventListener() {
                 @Override public void eventDispatched(AWTEvent e) {
                     if (e.getID() == WindowEvent.WINDOW_OPENED && e.getSource() instanceof Window) {
@@ -67,6 +83,10 @@ public final class SwingScaleAgent {
             Dimension before = w.getSize();
             Rectangle where = w.getBounds();
             scaleTree(w);
+            /* a fixed-size window: open it for the resize, then fixed again (the window manager takes the new
+               fixed size from the size hints written while it is resizable) */
+            boolean fixed = (w instanceof Frame && !((Frame) w).isResizable()) || (w instanceof Dialog && !((Dialog) w).isResizable());
+            if (fixed) setResizable(w, true);
             if (fixedLayout) {
                 w.setSize(Math.round(before.width * factor), Math.round(before.height * factor));
             } else {
@@ -74,6 +94,7 @@ public final class SwingScaleAgent {
                 Dimension p = w.getSize();
                 w.setSize(Math.max(p.width, Math.round(before.width * factor)), Math.max(p.height, Math.round(before.height * factor)));
             }
+            if (fixed) setResizable(w, false);
             Dimension after = w.getSize();               // keep the window centred where it was
             w.setLocation(where.x - (after.width - where.width) / 2, where.y - (after.height - where.height) / 2);
             w.validate();
@@ -81,6 +102,11 @@ public final class SwingScaleAgent {
         } catch (Throwable t) {
             // never break the application because of cosmetics
         }
+    }
+
+    private static void setResizable(Window w, boolean on) {
+        if (w instanceof Frame) ((Frame) w).setResizable(on);
+        else if (w instanceof Dialog) ((Dialog) w).setResizable(on);
     }
 
     private static void scaleTree(Component c) {
