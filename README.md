@@ -7,6 +7,7 @@ handles Debian/Mint/Pop!_OS, Fedora/RHEL, openSUSE, Arch, Alpine and Void.
 | Service | Endpoint | Used by |
 |---|---|---|
 | eOffice signer: NIC DSC Signer Service **4.1.8** | `https://eoffsigner.eoffice.gov.in:55101` | eOffice portals configured for signer 4.1 (e.g. `*.eoffice.railnet.gov.in`) |
+| eOffice signer: NIC DSC Signer Service **7.0.6** (optional) | `https://eoffsigner.eoffice.gov.in:55103` | eOffice portals configured for signer 7.x |
 | CrisSigner | `wss://127.0.0.1:2039` | CRIS portals |
 | IREPSSigner | `wss://127.0.0.1:2175` | IREPS |
 
@@ -30,11 +31,30 @@ handles Debian/Mint/Pop!_OS, Fedora/RHEL, openSUSE, Arch, Alpine and Void.
 Run `install` again at any time. It repairs whatever is broken and leaves healthy
 parts alone (`repair` is the same command).
 
+## Choosing the eOffice signer version
+
+Different eOffice portals ask for different signer versions. `install` asks which one
+you need, or you can choose directly:
+
+    railway-dsc install --eoffice=4      # 4.1.8 only (default; portals set to "4.1", port 55101)
+    railway-dsc install --eoffice=7      # 7.0.6 only (portals set to "7.x", port 55103)
+    railway-dsc install --eoffice=both   # both side by side; their ports do not clash
+
+The choice is saved as `DSC_EOFFICE` in `~/.config/railway-dsc/suite.conf`. Switching
+turns off the version you no longer want but keeps its files. Not sure which one you
+need? Choose `both`. With the wrong signer, a portal says "Unable to connect with DSC
+service application" or "Mismatch in DSC version".
+
+7.0.6 comes from NIC's `DigitalSignerService_7.0.6_Ubuntu_Installer.zip` in `~/Downloads`
+(or `--zip7=FILE`, the unpacked folder, or an existing `/usr/local` install). It is
+checksum-pinned and runs unmodified on Java 17 (NIC's bundled `jre.zip` is used when no
+Java 17 is installed). Like 4.1.8, it is bound to the loopback address only.
+
 ## Commands
 
     railway-dsc doctor      # check everything; explains each problem and its fix
     railway-dsc status      # health of every service, token and watchdog
-    railway-dsc install     # install / repair   (--msi=FILE, --no-root, --no-download)
+    railway-dsc install     # install / repair   (--eoffice=4|7|both, --msi=FILE, --zip7=FILE, --no-root, --no-download)
     railway-dsc logs        # recent watchdog actions and signer logs
     railway-dsc restart     # restart all signers
     railway-dsc heal        # run the watchdog once now
