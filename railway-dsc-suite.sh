@@ -30,11 +30,15 @@
 #
 #  Commands: install|repair | doctor | status | heal | start|stop|restart | logs |
 #            trust | pack | uninstall | help
+#
+#  PDF signing (4.6): installs GNOME Document Viewer (Papers), lets it reach the token
+#  (AppArmor + NSS), trusts the CCA India root for signatures, and adds "sign-pdf" plus a
+#  "Sign PDF with DSC" app / Files right-click entry.
 # ==============================================================================
 set -u
 set -o pipefail
 
-SUITE_VERSION="4.5.1"
+SUITE_VERSION="4.6.0"
 MARKER="__PAYLOAD_BELOW__"
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
 
@@ -60,6 +64,12 @@ VENDOR_HOOK="/etc/profile.d/DSC706-start.sh"
 MTOKEN_LIB="/usr/lib/libcryptoid_pkcs11.so"
 UDEV_RULE="/etc/udev/rules.d/90-dsc-tokens.rules"
 LEGACY_UNITS="eofficesigner eofficesigner-proxy"     # 7.0.6 signer and the old v4 bridge
+# PDF signing: the Indian root CA (public; https://cca.gov.in), pinned; pyHanko versions tested
+CCA_ROOT_SHA256="9A:3F:D3:17:67:98:E8:42:DD:CB:12:C2:62:F1:1C:FA:CC:A7:0A:8B:84:C6:EA:6F:DA:30:84:2A:95:A9:4C:D8"
+PYHANKO_REQ="pyhanko[pkcs11]==0.38.1"
+AA_BEGIN="# --- railway-dsc: DSC USB token for digital signing (begin) ---"
+AA_END="# --- railway-dsc: DSC USB token for digital signing (end) ---"
+AA_VIEWERS="usr.bin.papers usr.bin.evince"          # AppArmor profiles of PDF viewers that sign through NSS
 
 set_user_paths() {            # $1 = home directory
     U_HOME="$1"
@@ -92,6 +102,12 @@ set_user_paths() {            # $1 = home directory
     BIN="$U_HOME/.local/bin/railway-dsc"
     UNIT_DIR="$U_HOME/.config/systemd/user"
     AUTOSTART="$U_HOME/.config/autostart/railway-dsc-supervisor.desktop"
+    PDF_VENV="$U_HOME/.local/share/dsc-pdfsign"
+    PDF_PY="$PDF_VENV/sign_pdf.py"
+    PDF_BIN="$U_HOME/.local/bin/sign-pdf"
+    PDF_DESKTOP="$U_HOME/.local/share/applications/sign-pdf-dsc.desktop"
+    PDF_NAUTILUS="$U_HOME/.local/share/nautilus/scripts/Sign PDF with DSC"
+    NSSDB="$U_HOME/.pki/nssdb"
 }
 set_user_paths "$HOME"
 
@@ -722,6 +738,11 @@ cmd_pack() {
     if j17=$(find_java_modern); then r="$(dirname "$(dirname "$(readlink -f "$j17")")")"; cp -aL "$r" "$st/jre17" && ok "Java $(java_major "$j17") runtime added for CRIS/IREPS ($r)"
     else warn "no Java 11+ to pack"; fi
     [ -f "$MTOKEN_LIB" ] && cp -p "$MTOKEN_LIB" "$st/drivers/"
+    # pyHanko for sign-pdf, as wheels for this machine's Python (the target falls back to PyPI on another Python)
+    local pip="$PDF_VENV/bin/pip"; [ -x "$pip" ] || pip=""
+    if [ -n "$pip" ] && mkdir -p "$st/pdf/wheels" && "$pip" download -q -d "$st/pdf/wheels" "$PYHANKO_REQ" >/dev/null 2>&1; then
+        ok "pyHanko wheels added for Python $(python3 -c 'import sys;print("%d.%d"%sys.version_info[:2])') ($(du -sh "$st/pdf/wheels" | cut -f1))"
+    else rm -rf "$st/pdf"; warn "pyHanko wheels not added (needs sign-pdf installed here and internet) - targets will download them"; fi
     ( cd "$st" && find . -type f ! -name MANIFEST.sha256 -print0 | sort -z | xargs -0 sha256sum > MANIFEST.sha256 )
     info "Compressing ..."
     local n; n=$(grep -a -n -m1 "^${MARKER}\$" "$SELF" | cut -d: -f1)
@@ -771,6 +792,8 @@ pkgs_for() {                  # $1 = logical need -> distro package names
         smartcard:zypper) echo "pcsc-lite pcsc-ccid opensc";;
         smartcard:pacman|smartcard:xbps) echo "pcsclite ccid opensc";;
         smartcard:apk) echo "pcsc-lite ccid opensc";;
+        pdfviewer:apt) echo "papers evince";;            pdfviewer:*) echo "papers evince";;   # first that installs
+        venv:apt) echo python3-venv;;                    venv:*) echo "";;                    # ensurepip elsewhere
     esac
 }
 xlibs_missing() {
@@ -780,6 +803,34 @@ xlibs_missing() {
         case "$c" in *"$l"*) ;; *) return 0;; esac
     done
     return 1
+}
+
+# ---- PDF signing: what needs root -----------------------------------------------
+pdf_viewer() { local v; for v in papers evince; do have "$v" && { echo "$v"; return 0; }; done; return 1; }
+venv_ok() { python3 -c 'import ensurepip, venv' >/dev/null 2>&1; }
+aa_enabled() { [ "$(cat /sys/module/apparmor/parameters/enabled 2>/dev/null)" = Y ] && [ -d /etc/apparmor.d ]; }
+aa_viewer_profiles() { local p; for p in $AA_VIEWERS; do [ -f "/etc/apparmor.d/$p" ] && echo "$p"; done; }
+aa_rules_missing() {          # a viewer's AppArmor profile does not yet let it reach the token -> prints the profile
+    aa_enabled || return 1
+    local p; for p in $(aa_viewer_profiles); do grep -qsF "$AA_BEGIN" "/etc/apparmor.d/local/$p" || { echo "$p"; return 0; }; done
+    return 1
+}
+aa_add_token_rules() {        # root: the token's PKCS#11 driver (loaded by NSS inside the viewer) needs the USB tree.
+    # Without this the mToken driver's libusb_init() fails under the profile and the driver crashes the viewer.
+    aa_enabled || return 0
+    local p f
+    for p in $(aa_viewer_profiles); do
+        f="/etc/apparmor.d/local/$p"
+        grep -qsF "$AA_BEGIN" "$f" && continue
+        mkdir -p /etc/apparmor.d/local; touch "$f"; cp -p "$f" "$f.bak-railway-dsc"
+        printf '%s\n' "$AA_BEGIN" \
+            "# the token's driver (loaded by NSS from ~/.pki/nssdb/pkcs11.txt) finds the token through libusb" \
+            "/dev/bus/usb/ r," "/dev/bus/usb/** rw," "/sys/bus/usb/devices/ r," "/sys/devices/**/usb[0-9]*/** r," \
+            "/run/udev/data/c189:* r," "network netlink raw," "$AA_END" >> "$f"
+        if apparmor_parser -r "/etc/apparmor.d/$p" >/dev/null 2>&1; then ok "AppArmor: ${p#usr.bin.} may now use the DSC token"
+        else cp -p "$f.bak-railway-dsc" "$f"; apparmor_parser -r "/etc/apparmor.d/$p" >/dev/null 2>&1
+             warn "AppArmor refused the token rules for ${p#usr.bin.} - left unchanged"; fi
+    done
 }
 
 opensc_present() { local l; for l in $OPENSC_LIBS; do [ -f "$l" ] && return 0; done; return 1; }
@@ -792,8 +843,8 @@ find_epass_zip() {            # Feitian's Linux driver zip: explicit file, or th
     return 1
 }
 
-cmd_root() {                  # internal: runs under sudo.  args: user payload_dir need_java8 need_java17 need_cab epass_zip
-    local user="$1" payload="$2" nj8="$3" nj17="$4" ncab="$5" epass="${6:-}" home
+cmd_root() {                  # internal: runs under sudo.  args: user payload_dir need_java8 need_java17 need_cab epass_zip pdf
+    local user="$1" payload="$2" nj8="$3" nj17="$4" ncab="$5" epass="${6:-}" pdf="${7:-0}" home
     [ "$(id -u)" -eq 0 ] || die "root phase must run as root"
     home=$(getent passwd "$user" | cut -d: -f6); [ -n "$home" ] || die "unknown user $user"
     set_user_paths "$home"
@@ -809,6 +860,12 @@ cmd_root() {                  # internal: runs under sudo.  args: user payload_d
     [ "$nj17" = 1 ] && pkg_install $(pkgs_for java17)
     smartcard_stack_ok || pkg_install $(pkgs_for smartcard)      # pcscd + CCID + OpenSC (ePass2003, smart cards)
     if have systemctl && [ -d /run/systemd/system ]; then systemctl enable --now pcscd.socket >/dev/null 2>&1 || true; fi
+    if [ "$pdf" = 1 ]; then                                     # PDF signing: viewer, Python venv, AppArmor
+        local v; for v in $(pkgs_for pdfviewer); do pdf_viewer >/dev/null && break; pkg_install "$v"; done
+        pdf_viewer >/dev/null || warn "no PDF viewer with signing could be installed (papers / evince)"
+        venv_ok || { [ -n "$(pkgs_for venv)" ] && pkg_install $(pkgs_for venv); }
+        aa_add_token_rules
+    fi
     if [ -n "$epass" ] && [ -f "$epass" ] && [ ! -f "$CASTLE_LIB" ] && [ "$(uname -m)" = x86_64 ]; then
         # Only the PKCS#11 library is taken; Feitian's config scripts (hotplug edits) are not run -
         # the suite's udev rule already gives the desktop user access to the token.
@@ -909,6 +966,83 @@ trust_certs() {
         n=$((n+1))
     done < <(nss_dbs)
     ok "Certificates trusted in $n browser store(s) - restart the browser to pick them up"
+}
+
+# ============================================================ PDF signing ===
+# "sign-pdf" (source: extras/sign-pdf/sign_pdf.py) and the CCA India 2022 root (extras/sign-pdf/CCAIndia2022.pem)
+SIGNPDF_SHA="ac745b8d6ae17c5e9140b226f7ad06e3d80b8f537ab891b3668fb1949ef7c15d"
+SIGNPDF_B64="IiIiU2lnbiBhIFBERiB3aXRoIHRoZSBEU0MgVVNCIHRva2VuIChQQWRFUywgdmlzaWJsZSBzaWduYXR1cmUgYm94IGJ5IGRlZmF1bHQpLgoKICAgIHNpZ24tcGRmIGxldHRlci5wZGYgICAgICAgICAgICAgICAgICAgICAgICAgLT4gbGV0dGVyX3NpZ25lZC5wZGYsIGJveCBhdCBib3R0b20tcmlnaHQgb2YgdGhlIGxhc3QgcGFnZQogICAgc2lnbi1wZGYgbGV0dGVyLnBkZiAtbyBvdXQucGRmIC0tcmVhc29uICJBcHByb3ZlZCIgLS1sb2NhdGlvbiAiUmF0bGFtIgogICAgc2lnbi1wZGYgbGV0dGVyLnBkZiAtLXBhZ2UgMSAtLXBvcyBibCAgICAgICBmaXJzdCBwYWdlLCBib3R0b20tbGVmdAogICAgc2lnbi1wZGYgbGV0dGVyLnBkZiAtLWludmlzaWJsZSAgICAgICAgICAgICBubyBib3ggKHRoZSBzaWduYXR1cmUgaXMgc3RpbGwgaW4gdGhlIGZpbGUpCgpUaGUgdG9rZW4gUElOIGlzIGFza2VkIGZvciBldmVyeSB0aW1lICh0ZXJtaW5hbCwgb3IgYSBwYXNzd29yZCBib3ggd2hlbiBzdGFydGVkIGZyb20gdGhlIGZpbGUgbWFuYWdlcikgYW5kIGlzCm5ldmVyIHN0b3JlZC4gVGhlIHRva2VuJ3MgZHJpdmVyIGlzIGNob3NlbiBieSB0aGUgdG9rZW4gcGx1Z2dlZCBpbiAoc2FtZSB0YWJsZSBhcyByYWlsd2F5LWRzYykuCiIiIgppbXBvcnQgYXJncGFyc2UKaW1wb3J0IGdldHBhc3MKaW1wb3J0IG9zCmltcG9ydCBzaHV0aWwKaW1wb3J0IHN1YnByb2Nlc3MKaW1wb3J0IHN5cwoKZnJvbSBweWhhbmtvLnBkZl91dGlscy5pbmNyZW1lbnRhbF93cml0ZXIgaW1wb3J0IEluY3JlbWVudGFsUGRmRmlsZVdyaXRlcgpmcm9tIHB5aGFua28uc2lnbiBpbXBvcnQgZmllbGRzLCBzaWduZXJzCmZyb20gcHloYW5rby5zaWduLnBrY3MxMSBpbXBvcnQgUEtDUzExU2lnbmVyLCBvcGVuX3BrY3MxMV9zZXNzaW9uCmZyb20gcHloYW5rby5zdGFtcCBpbXBvcnQgVGV4dFN0YW1wU3R5bGUKCk9QRU5TQyA9IFsiL3Vzci9saWIveDg2XzY0LWxpbnV4LWdudS9vcGVuc2MtcGtjczExLnNvIiwgIi91c3IvbGliL3g4Nl82NC1saW51eC1nbnUvcGtjczExL29wZW5zYy1wa2NzMTEuc28iXQpEUklWRVJTID0geyAgIyBVU0IgdmVuZG9yIGlkIC0+IFBLQ1MjMTEgZHJpdmVycywgYmVzdCBmaXJzdCAobWlycm9ycyByYWlsd2F5LWRzYydzIHAxMV9mb3JfdmlkKQogICAgIjA1NWMiOiBbIi91c3IvbGliL2xpYmNyeXB0b2lkX3BrY3MxMS5zbyIsICIvdXNyL2xpYi9saWJtVG9rZW5QS0NTMTEuc28iXSwKICAgICIwOTZlIjogWyIvdXNyL2xpYi9saWJjYXN0bGUuc28uMS4wLjAiLCAiL3Vzci9saWIvbGliY2FzdGxlLnNvIiwgIi91c3IvbGliL3g4Nl82NC1saW51eC1nbnUvbGliY2FzdGxlLnNvIl0gKyBPUEVOU0MsCiAgICAiMTYzYyI6IFsiL3Vzci9saWIvV2F0Y2hEYXRhL1Byb3hLZXkvbGliL2xpYndkcGtjc19TaWduYXR1cmVQMTEuc28iLCAiL3Vzci9saWIvV2F0Y2hEYXRhL1RSVVNUS0VZL2xpYi9saWJ3ZHBrY3NfVFJVU1RLRVkuc28iLAogICAgICAgICAgICAgIi91c3IvbGliL1dhdGNoRGF0YS9lTXVkaHJhXzMuNC4zL2xpYi9saWJ3ZHBrY3NfZU11ZGhyYV8zNDMuc28iLCAiL3Vzci9saWIvV2F0Y2hEYXRhL1BST1hLZXkvbGliL2xpYndkcGtjcy5zbyIsCiAgICAgICAgICAgICAiL3Vzci9saWIvbGlid2Rwa2NzLnNvIl0sCiAgICAiMDUyOSI6IFsiL3Vzci9saWIvbGliZVRQa2NzMTEuc28iLCAiL3Vzci9saWIvbGliZVRva2VuLnNvIl0sCiAgICAiMDhlNiI6IFsiL3Vzci9saWIvcGtjczExL2xpYmd0b3AxMWRvdG5ldC5zbyIsICIvdXNyL2xpYi9saWJndG9wMTFkb3RuZXQuc28iXSArIE9QRU5TQywKICAgICIyNGRjIjogWyIvdXNyL2xpYi9saWJqY1BLQ1MxMS0yLnNvIiwgIi91c3IvbGliL3g4Nl82NC1saW51eC1nbnUvbGliamNQS0NTMTEtMi5zbyJdLAogICAgIjA0ZTYiOiBPUEVOU0MsICIwNzJmIjogT1BFTlNDLAp9CkdVSSA9IG5vdCBzeXMuc3RkaW4uaXNhdHR5KCkKCgpkZWYgc2F5KG1zZywgZXJyb3I9RmFsc2UpOgogICAgcHJpbnQobXNnLCBmaWxlPXN5cy5zdGRlcnIgaWYgZXJyb3IgZWxzZSBzeXMuc3Rkb3V0LCBmbHVzaD1UcnVlKQoKCmRlZiBmYWlsKG1zZyk6CiAgICBzYXkoInNpZ24tcGRmOiAiICsgbXNnLCBlcnJvcj1UcnVlKQogICAgaWYgR1VJIGFuZCBzaHV0aWwud2hpY2goInplbml0eSIpOgogICAgICAgIHN1YnByb2Nlc3MucnVuKFsiemVuaXR5IiwgIi0tZXJyb3IiLCAiLS10aXRsZT1TaWduIFBERiIsICItLW5vLXdyYXAiLCAiLS10ZXh0PSIgKyBtc2ddKQogICAgc3lzLmV4aXQoMSkKCgpkZWYgcGx1Z2dlZF92aWRzKCk6CiAgICBvdXQgPSBbXQogICAgZm9yIGQgaW4gb3MubGlzdGRpcigiL3N5cy9idXMvdXNiL2RldmljZXMiKToKICAgICAgICB0cnk6CiAgICAgICAgICAgIHdpdGggb3BlbihmIi9zeXMvYnVzL3VzYi9kZXZpY2VzL3tkfS9pZFZlbmRvciIpIGFzIGY6CiAgICAgICAgICAgICAgICBvdXQuYXBwZW5kKGYucmVhZCgpLnN0cmlwKCkubG93ZXIoKSkKICAgICAgICBleGNlcHQgT1NFcnJvcjoKICAgICAgICAgICAgcGFzcwogICAgcmV0dXJuIG91dAoKCmRlZiBmaW5kX2RyaXZlcihvdmVycmlkZSk6CiAgICBpZiBvdmVycmlkZToKICAgICAgICByZXR1cm4gb3ZlcnJpZGUgaWYgb3MucGF0aC5pc2ZpbGUob3ZlcnJpZGUpIGVsc2UgZmFpbCgibm8gc3VjaCBQS0NTIzExIGRyaXZlcjogIiArIG92ZXJyaWRlKQogICAga25vd24gPSBGYWxzZQogICAgZm9yIHYgaW4gcGx1Z2dlZF92aWRzKCk6CiAgICAgICAgaWYgdiBpbiBEUklWRVJTOgogICAgICAgICAgICBrbm93biA9IFRydWUKICAgICAgICAgICAgZm9yIGxpYiBpbiBEUklWRVJTW3ZdOgogICAgICAgICAgICAgICAgaWYgb3MucGF0aC5pc2ZpbGUobGliKToKICAgICAgICAgICAgICAgICAgICByZXR1cm4gbGliCiAgICBpZiBrbm93bjoKICAgICAgICBmYWlsKCJ0aGUgcGx1Z2dlZCB0b2tlbidzIGRyaXZlciBpcyBub3QgaW5zdGFsbGVkIChydW46IHJhaWx3YXktZHNjIGRvY3RvcikiKQogICAgZmFpbCgibm8gRFNDIHRva2VuIGZvdW5kIC0gcGx1ZyBpbiB0aGUgVVNCIHRva2VuIGFuZCB0cnkgYWdhaW4iKQoKCmRlZiBhc2tfcGluKCk6CiAgICBpZiBHVUkgYW5kIHNodXRpbC53aGljaCgiemVuaXR5Iik6CiAgICAgICAgciA9IHN1YnByb2Nlc3MucnVuKFsiemVuaXR5IiwgIi0tcGFzc3dvcmQiLCAiLS10aXRsZT1EU0MgdG9rZW4gUElOIl0sIGNhcHR1cmVfb3V0cHV0PVRydWUsIHRleHQ9VHJ1ZSkKICAgICAgICBpZiByLnJldHVybmNvZGUgIT0gMDoKICAgICAgICAgICAgc3lzLmV4aXQoMSkKICAgICAgICByZXR1cm4gci5zdGRvdXQucnN0cmlwKCJcbiIpCiAgICByZXR1cm4gZ2V0cGFzcy5nZXRwYXNzKCJUb2tlbiBQSU46ICIpCgoKZGVmIGlzX2NhKGNlcnQpOgogICAgYmMgPSBjZXJ0LmJhc2ljX2NvbnN0cmFpbnRzX3ZhbHVlCiAgICByZXR1cm4gYm9vbChiYyBhbmQgYmNbImNhIl0ubmF0aXZlKQoKCmRlZiBtZWRpYV9ib3godywgcGFnZV9peCk6CiAgICAiIiJUaGUgcGFnZSdzIHNpemUsIGEgTWVkaWFCb3ggaW5oZXJpdGVkIGZyb20gaXRzIHBhcmVudHMgaW5jbHVkZWQgKEE0IHdoZW4gbm9uZSBjYW4gYmUgcmVhZCkuIiIiCiAgICB0cnk6CiAgICAgICAgbm9kZSA9IHcuZmluZF9wYWdlX2Zvcl9tb2RpZmljYXRpb24ocGFnZV9peClbMF0uZ2V0X29iamVjdCgpCiAgICAgICAgd2hpbGUgbm9kZSBpcyBub3QgTm9uZToKICAgICAgICAgICAgaWYgIi9NZWRpYUJveCIgaW4gbm9kZToKICAgICAgICAgICAgICAgIHJldHVybiBbZmxvYXQoeCkgZm9yIHggaW4gbm9kZVsiL01lZGlhQm94Il1dCiAgICAgICAgICAgIHBhcmVudCA9IG5vZGUuZ2V0KCIvUGFyZW50IikKICAgICAgICAgICAgbm9kZSA9IHBhcmVudC5nZXRfb2JqZWN0KCkgaWYgcGFyZW50IGlzIG5vdCBOb25lIGVsc2UgTm9uZQogICAgZXhjZXB0IEV4Y2VwdGlvbjoKICAgICAgICBwYXNzCiAgICByZXR1cm4gWzAuMCwgMC4wLCA1OTUuMCwgODQyLjBdCgoKZGVmIHNpZ25fZmlsZShhLCBzcmMsIG91dCwgc2lnbmVyKToKICAgIHdpdGggb3BlbihzcmMsICJyYiIpIGFzIGY6CiAgICAgICAgdyA9IEluY3JlbWVudGFsUGRmRmlsZVdyaXRlcihmLCBzdHJpY3Q9RmFsc2UpCiAgICAgICAgbl9wYWdlcyA9IGludCh3LnJvb3RbIi9QYWdlcyJdWyIvQ291bnQiXSkKICAgICAgICB1c2VkID0gc2V0KCkKICAgICAgICB0cnk6CiAgICAgICAgICAgIGZvciB4IGluIHcucm9vdFsiL0Fjcm9Gb3JtIl1bIi9GaWVsZHMiXToKICAgICAgICAgICAgICAgIHVzZWQuYWRkKHN0cih4LmdldF9vYmplY3QoKS5nZXQoIi9UIikpKQogICAgICAgIGV4Y2VwdCBFeGNlcHRpb246CiAgICAgICAgICAgIHBhc3MKICAgICAgICBmaWVsZCA9IG5leHQoZiJTaWduYXR1cmV7aX0iIGZvciBpIGluIHJhbmdlKDEsIDk5OSkgaWYgZiJTaWduYXR1cmV7aX0iIG5vdCBpbiB1c2VkKQoKICAgICAgICBzdHlsZSA9IE5vbmUKICAgICAgICBpZiBhLmludmlzaWJsZToKICAgICAgICAgICAgc3BlYyA9IGZpZWxkcy5TaWdGaWVsZFNwZWMoZmllbGQpCiAgICAgICAgZWxzZToKICAgICAgICAgICAgcGFnZV9peCA9IChhLnBhZ2UgLSAxKSBpZiBhLnBhZ2UgZWxzZSBuX3BhZ2VzIC0gMQogICAgICAgICAgICBpZiBub3QgMCA8PSBwYWdlX2l4IDwgbl9wYWdlczoKICAgICAgICAgICAgICAgIGZhaWwoZiJwYWdlIHthLnBhZ2V9IGlzIG5vdCBpbiB0aGUgZG9jdW1lbnQgKGl0IGhhcyB7bl9wYWdlc30pIikKICAgICAgICAgICAgbGx4LCBsbHksIHVyeCwgdXJ5ID0gbWVkaWFfYm94KHcsIHBhZ2VfaXgpCiAgICAgICAgICAgIGJveF93LCBib3hfaCwgbSA9IDIxMCwgNjQsIDMwCiAgICAgICAgICAgIHggPSAodXJ4IC0gYm94X3cgLSBtKSBpZiBhLnBvcyBpbiAoImJyIiwgInRyIikgZWxzZSAobGx4ICsgbSkKICAgICAgICAgICAgeSA9IChsbHkgKyBtKSBpZiBhLnBvcyBpbiAoImJyIiwgImJsIikgZWxzZSAodXJ5IC0gYm94X2ggLSBtKQogICAgICAgICAgICBzcGVjID0gZmllbGRzLlNpZ0ZpZWxkU3BlYyhmaWVsZCwgb25fcGFnZT1wYWdlX2l4LCBib3g9KGludCh4KSwgaW50KHkpLCBpbnQoeCArIGJveF93KSwgaW50KHkgKyBib3hfaCkpKQogICAgICAgICAgICBsaW5lcyA9ICJEaWdpdGFsbHkgc2lnbmVkIGJ5ICUoc2lnbmVyKXNcbkRhdGU6ICUodHMpcyIKICAgICAgICAgICAgaWYgYS5yZWFzb246CiAgICAgICAgICAgICAgICBsaW5lcyArPSAiXG5SZWFzb246ICIgKyBhLnJlYXNvbi5yZXBsYWNlKCIlIiwgIiUlIikKICAgICAgICAgICAgaWYgYS5sb2NhdGlvbjoKICAgICAgICAgICAgICAgIGxpbmVzICs9ICJcbkxvY2F0aW9uOiAiICsgYS5sb2NhdGlvbi5yZXBsYWNlKCIlIiwgIiUlIikKICAgICAgICAgICAgc3R5bGUgPSBUZXh0U3RhbXBTdHlsZShzdGFtcF90ZXh0PWxpbmVzLCB0aW1lc3RhbXBfZm9ybWF0PSIlZC0lbS0lWSAlSDolTTolUyAleiIsIGJvcmRlcl93aWR0aD0xKQoKICAgICAgICBtZXRhID0gc2lnbmVycy5QZGZTaWduYXR1cmVNZXRhZGF0YShmaWVsZF9uYW1lPWZpZWxkLCByZWFzb249YS5yZWFzb24sIGxvY2F0aW9uPWEubG9jYXRpb24sCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgbWRfYWxnb3JpdGhtPSJzaGEyNTYiLCBzdWJmaWx0ZXI9ZmllbGRzLlNpZ1NlZWRTdWJGaWx0ZXIuUEFERVMpCiAgICAgICAgdG1wID0gb3V0ICsgIi5wYXJ0IgogICAgICAgIHRyeToKICAgICAgICAgICAgd2l0aCBvcGVuKHRtcCwgIndiIikgYXMgbzoKICAgICAgICAgICAgICAgIHNpZ25lcnMuUGRmU2lnbmVyKG1ldGEsIHNpZ25lciwgc3RhbXBfc3R5bGU9c3R5bGUsIG5ld19maWVsZF9zcGVjPXNwZWMpLnNpZ25fcGRmKHcsIG91dHB1dD1vKQogICAgICAgIGV4Y2VwdCBCYXNlRXhjZXB0aW9uOgogICAgICAgICAgICBpZiBvcy5wYXRoLmV4aXN0cyh0bXApOgogICAgICAgICAgICAgICAgb3MucmVtb3ZlKHRtcCkKICAgICAgICAgICAgcmFpc2UKICAgIG9zLnJlcGxhY2UodG1wLCBvdXQpCgoKZGVmIHJlcG9ydChvdXQpOgogICAgc2F5KGYic2lnbmVkICA6IHtvdXR9IikKICAgIGlmIHNodXRpbC53aGljaCgicGRmc2lnIik6CiAgICAgICAgciA9IHN1YnByb2Nlc3MucnVuKFsicGRmc2lnIiwgb3V0XSwgY2FwdHVyZV9vdXRwdXQ9VHJ1ZSwgdGV4dD1UcnVlKQogICAgICAgIG9rID0gIlNpZ25hdHVyZSBWYWxpZGF0aW9uOiBTaWduYXR1cmUgaXMgVmFsaWQiIGluIHIuc3Rkb3V0CiAgICAgICAgc2F5KCJjaGVjayAgIDogIiArICgidGhlIHNpZ25hdHVyZSBpcyB2YWxpZCIgaWYgb2sgZWxzZSAicGRmc2lnIGNvdWxkIG5vdCBjb25maXJtIGl0OlxuIiArIHIuc3Rkb3V0LnN0cmlwKCkpKQogICAgaWYgR1VJIGFuZCBzaHV0aWwud2hpY2goIm5vdGlmeS1zZW5kIik6CiAgICAgICAgc3VicHJvY2Vzcy5ydW4oWyJub3RpZnktc2VuZCIsICJQREYgc2lnbmVkIiwgb3MucGF0aC5iYXNlbmFtZShvdXQpXSkKICAgIGlmIEdVSSBhbmQgb3MuZW52aXJvbi5nZXQoIlNJR05fUERGX09QRU4iLCAiMSIpID09ICIxIiBhbmQgc2h1dGlsLndoaWNoKCJwYXBlcnMiKTogICAjIHNob3cgdGhlIHJlc3VsdAogICAgICAgIHN1YnByb2Nlc3MuUG9wZW4oWyJwYXBlcnMiLCBvdXRdLCBzdGRvdXQ9c3VicHJvY2Vzcy5ERVZOVUxMLCBzdGRlcnI9c3VicHJvY2Vzcy5ERVZOVUxMLCBzdGFydF9uZXdfc2Vzc2lvbj1UcnVlKQoKCmRlZiBtYWluKCk6CiAgICBhcCA9IGFyZ3BhcnNlLkFyZ3VtZW50UGFyc2VyKHByb2c9InNpZ24tcGRmIiwgZGVzY3JpcHRpb249IlNpZ24gYSBQREYgd2l0aCB0aGUgRFNDIFVTQiB0b2tlbi4iKQogICAgYXAuYWRkX2FyZ3VtZW50KCJwZGYiLCBuYXJncz0iPyIsIGhlbHA9InRoZSBQREYgKGFza2VkIGZvciBpbiBhIGZpbGUgY2hvb3NlciB3aGVuIHN0YXJ0ZWQgZnJvbSB0aGUgYXBwIG1lbnUpIikKICAgIGFwLmFkZF9hcmd1bWVudCgiLW8iLCAiLS1vdXRwdXQiLCBoZWxwPSJvdXRwdXQgZmlsZSAoZGVmYXVsdDogPG5hbWU+X3NpZ25lZC5wZGYpIikKICAgIGFwLmFkZF9hcmd1bWVudCgiLS1yZWFzb24iLCBkZWZhdWx0PU5vbmUpCiAgICBhcC5hZGRfYXJndW1lbnQoIi0tbG9jYXRpb24iLCBkZWZhdWx0PU5vbmUpCiAgICBhcC5hZGRfYXJndW1lbnQoIi0tcGFnZSIsIHR5cGU9aW50LCBkZWZhdWx0PTAsIGhlbHA9InBhZ2UgZm9yIHRoZSBib3gsIDEgPSBmaXJzdCAoZGVmYXVsdDogbGFzdCBwYWdlKSIpCiAgICBhcC5hZGRfYXJndW1lbnQoIi0tcG9zIiwgY2hvaWNlcz1bImJyIiwgImJsIiwgInRyIiwgInRsIl0sIGRlZmF1bHQ9ImJyIiwgaGVscD0iY29ybmVyIGZvciB0aGUgYm94IChkZWZhdWx0IGJyKSIpCiAgICBhcC5hZGRfYXJndW1lbnQoIi0taW52aXNpYmxlIiwgYWN0aW9uPSJzdG9yZV90cnVlIiwgaGVscD0ibm8gdmlzaWJsZSBib3giKQogICAgYXAuYWRkX2FyZ3VtZW50KCItLWxpYiIsIGhlbHA9IlBLQ1MjMTEgZHJpdmVyIHRvIHVzZSBpbnN0ZWFkIG9mIHRoZSBhdXRvbWF0aWMgY2hvaWNlIikKICAgIGEgPSBhcC5wYXJzZV9hcmdzKCkKICAgIGlmIG5vdCBhLnBkZjoKICAgICAgICBpZiBub3QgKEdVSSBhbmQgc2h1dGlsLndoaWNoKCJ6ZW5pdHkiKSk6CiAgICAgICAgICAgIGFwLmVycm9yKCJnaXZlIHRoZSBQREYgdG8gc2lnbiIpCiAgICAgICAgciA9IHN1YnByb2Nlc3MucnVuKFsiemVuaXR5IiwgIi0tZmlsZS1zZWxlY3Rpb24iLCAiLS10aXRsZT1DaG9vc2UgdGhlIFBERiB0byBzaWduIiwgIi0tZmlsZS1maWx0ZXI9UERGIHwgKi5wZGYgKi5QREYiXSwKICAgICAgICAgICAgICAgICAgICAgICAgICAgY2FwdHVyZV9vdXRwdXQ9VHJ1ZSwgdGV4dD1UcnVlKQogICAgICAgIGlmIHIucmV0dXJuY29kZSAhPSAwIG9yIG5vdCByLnN0ZG91dC5zdHJpcCgpOgogICAgICAgICAgICBzeXMuZXhpdCgwKQogICAgICAgIGEucGRmID0gci5zdGRvdXQuc3RyaXAoKQoKICAgIHNyYyA9IG9zLnBhdGguYWJzcGF0aChhLnBkZikKICAgIGlmIG5vdCBvcy5wYXRoLmlzZmlsZShzcmMpOgogICAgICAgIGZhaWwoIm5vIHN1Y2ggZmlsZTogIiArIGEucGRmKQogICAgcm9vdCwgXyA9IG9zLnBhdGguc3BsaXRleHQoc3JjKQogICAgb3V0ID0gb3MucGF0aC5hYnNwYXRoKGEub3V0cHV0KSBpZiBhLm91dHB1dCBlbHNlIHJvb3QgKyAiX3NpZ25lZC5wZGYiCiAgICBpZiBvdXQgPT0gc3JjOgogICAgICAgIGZhaWwoInRoZSBvdXRwdXQgbXVzdCBiZSBhIG5ldyBmaWxlLCBub3QgdGhlIG9yaWdpbmFsIikKCiAgICB0ZXN0X3AxMiA9IG9zLmVudmlyb24uZ2V0KCJTSUdOX1BERl9URVNUX1AxMiIpICAgIyBzZWxmLXRlc3Qgb25seTogYSB0aHJvd2F3YXkga2V5IGZpbGUgaW5zdGVhZCBvZiB0aGUgdG9rZW4KICAgIGlmIHRlc3RfcDEyOgogICAgICAgIHNpZ25fZmlsZShhLCBzcmMsIG91dCwgc2lnbmVycy5TaW1wbGVTaWduZXIubG9hZF9wa2NzMTIodGVzdF9wMTIsIHBhc3NwaHJhc2U9Tm9uZSkpCiAgICAgICAgcmV0dXJuIHJlcG9ydChvdXQpCgogICAgbGliID0gZmluZF9kcml2ZXIoYS5saWIpCiAgICBwaW4gPSBhc2tfcGluKCkKICAgIGlmIG5vdCBwaW46CiAgICAgICAgZmFpbCgibm8gUElOIGdpdmVuIikKICAgIHRyeToKICAgICAgICBzZXNzaW9uID0gb3Blbl9wa2NzMTFfc2Vzc2lvbihsaWIsIHVzZXJfcGluPXBpbikKICAgIGV4Y2VwdCBFeGNlcHRpb24gYXMgZTogICMgd3JvbmcgUElOLCBsb2NrZWQgdG9rZW4sIHRva2VuIGJ1c3kKICAgICAgICBmYWlsKCJjb3VsZCBub3Qgb3BlbiB0aGUgdG9rZW46ICIgKyAoc3RyKGUpIG9yIGUuX19jbGFzc19fLl9fbmFtZV9fKSArCiAgICAgICAgICAgICAiXG4oYSB3cm9uZyBQSU4gY291bnRzIHRvd2FyZHMgbG9ja2luZyB0aGUgdG9rZW4gLSBjaGVjayBpdCBiZWZvcmUgdHJ5aW5nIGFnYWluKSIpCiAgICBmaW5hbGx5OgogICAgICAgIHBpbiA9IE5vbmUKCiAgICB0cnk6CiAgICAgICAgaW1wb3J0IHBrY3MxMQogICAgICAgIGZyb20gYXNuMWNyeXB0byBpbXBvcnQgeDUwOQogICAgICAgIGtleV9pZHMgPSB7ay5pZCBmb3IgayBpbiBzZXNzaW9uLmdldF9vYmplY3RzKHtwa2NzMTEuQXR0cmlidXRlLkNMQVNTOiBwa2NzMTEuT2JqZWN0Q2xhc3MuUFJJVkFURV9LRVl9KX0KICAgICAgICBtaW5lID0gW10KICAgICAgICBmb3IgYyBpbiBzZXNzaW9uLmdldF9vYmplY3RzKHtwa2NzMTEuQXR0cmlidXRlLkNMQVNTOiBwa2NzMTEuT2JqZWN0Q2xhc3MuQ0VSVElGSUNBVEV9KToKICAgICAgICAgICAgY2VydCA9IHg1MDkuQ2VydGlmaWNhdGUubG9hZChjW3BrY3MxMS5BdHRyaWJ1dGUuVkFMVUVdKQogICAgICAgICAgICBpZiBjLmlkIGluIGtleV9pZHMgYW5kIG5vdCBpc19jYShjZXJ0KToKICAgICAgICAgICAgICAgIG1pbmUuYXBwZW5kKChjLmlkLCBjZXJ0KSkKICAgICAgICBpZiBub3QgbWluZToKICAgICAgICAgICAgZmFpbCgibm8gc2lnbmluZyBjZXJ0aWZpY2F0ZSB3aXRoIGEgcHJpdmF0ZSBrZXkgb24gdGhpcyB0b2tlbiIpCiAgICAgICAgbWluZS5zb3J0KGtleT1sYW1iZGEgdDogdFsxXS5ub3RfdmFsaWRfYWZ0ZXIsIHJldmVyc2U9VHJ1ZSkgICAgICAjIHNldmVyYWw6IHRoZSBvbmUgdmFsaWQgbG9uZ2VzdAogICAgICAgIGNpZCwgY2VydCA9IG1pbmVbMF0KICAgICAgICBuYW1lID0gY2VydC5zdWJqZWN0Lm5hdGl2ZS5nZXQoImNvbW1vbl9uYW1lIiwgIkRTQyBob2xkZXIiKQogICAgICAgIHNheShmInNpZ25lciAgOiB7bmFtZX0gICh2YWxpZCB1bnRpbCB7Y2VydC5ub3RfdmFsaWRfYWZ0ZXI6JWQtJW0tJVl9KSIpCiAgICAgICAgc2lnbmVyID0gUEtDUzExU2lnbmVyKHNlc3Npb24sIGNlcnRfaWQ9Y2lkLCBrZXlfaWQ9Y2lkLCBvdGhlcl9jZXJ0c190b19wdWxsPU5vbmUpCiAgICAgICAgc2lnbl9maWxlKGEsIHNyYywgb3V0LCBzaWduZXIpCiAgICBmaW5hbGx5OgogICAgICAgIHNlc3Npb24uY2xvc2UoKQogICAgcmVwb3J0KG91dCkKCgppZiBfX25hbWVfXyA9PSAiX19tYWluX18iOgogICAgbWFpbigpCg=="
+CCA_ROOT_B64="LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tDQpNSUlGTkRDQ0F4eWdBd0lCQWdJUWRpUXo2OXNtZGxxRllNMEtxQy9oRnpBTkJna3Foa2lHOXcwQkFRc0ZBREE2DQpNUXN3Q1FZRFZRUUdFd0pKVGpFU01CQUdBMVVFQ2hNSlNXNWthV0VnVUV0Sk1SY3dGUVlEVlFRREV3NURRMEVnDQpTVzVrYVdFZ01qQXlNakFlRncweU1qQXlNREl4TWpBME16ZGFGdzAwTWpBeU1ESXhNakEwTXpkYU1Eb3hDekFKDQpCZ05WQkFZVEFrbE9NUkl3RUFZRFZRUUtFd2xKYm1ScFlTQlFTMGt4RnpBVkJnTlZCQU1URGtORFFTQkpibVJwDQpZU0F5TURJeU1JSUNJakFOQmdrcWhraUc5dzBCQVFFRkFBT0NBZzhBTUlJQ0NnS0NBZ0VBdjNFQnVkV0M4SFkwDQpvU3d0SlpDcXBqUVRHcEVld2wzRWREcVVPUlYwcW9GcDc4bWRSL3Z1QVRYSTgzRzduRjlSTHZtTmpnUWdLci9iDQpNeDZnUE80WTU3Yk1qQXNnd0V6bGVGY2xaa2Evc3FjNjhpTjVyUzNodWhyQ1g2TUVJTkx5RE9RNzFNUkE3R0pDDQphTkw2RTNqMTQzOGVUdTAxMW1saWtlWllCZGtodmZwQVZqQ3c5MHc4d2NXRG1xeDY2WTU2MVQvUmlYeXoydUVoDQpCQlpBRDQzZ1Y1OGVYU3RPZU9Ud0F6RVpZTXJtcDIzMkdmbVFLYWJZUmZkSVJ1czFhdnl1R2VhMm5JQ0VzUkhFDQo4TTJ0ZHp3cEdQN29JeTJxSEJGSkorM0F3bXdRQTREam1Ea0p0Q0QrNThhd29oUWF2Uk5ocWpzR0QrWmlmRzNWDQpSNGk2V3JLdjhPV3FaemNaajNnM0VscjUrZlJNbHoxR1Nxa1dQQncxRXY4S1dUSGF6U1VLRjdPTXhtM1h6eVh4DQpRbnc3ZlpGOUdPVnR4M2FkcGZSUHFZR2d0Yk9QMzRFVmt6NHdzSHZOTXJ2VXJZY0t5bWRPcm5rVGpsWDI2ZklIDQpVSnBLR1lrTGs5cTBqaE1OS3M0Um44bGo0cEo3WUYzMy9ORDRianBWMGV4MUVBUXowaVp2VDM3T254Tml1QVovDQorNERqZjA3NVV1TlgyZWNXbmFkT3JOMXI4TkFQYXJaSXdVb1NVbldoVThUcUFXV1JxekZVUkhVWnVPTVFjQTBnDQplZzRjOXpxdEJvVVBndFFrc2JJQUVzRVhtRHVScHdTSUZqRWtLMTFmNUVlbWZtZmRnMzdLeUlqUTY3VFJUbUJBDQora1Q5UTVKSW0vZTdtMUlMZy9IS2NrZ0xVT0NuQU1zQ0F3RUFBYU0yTURRd0R3WURWUjBUQVFIL0JBVXdBd0VCDQovekFSQmdOVkhRNEVDZ1FJVGp0SU5semlYMzB3RGdZRFZSMFBBUUgvQkFRREFnRUdNQTBHQ1NxR1NJYjNEUUVCDQpDd1VBQTRJQ0FRQ2RiRThkMWMxRHlzS3RydFlsQXBZSVhUbFkzTjJYSE5RNmdLb2FWV3NLYTFUSi9vdnJUK0ZWDQozYm1RTGV0M2FTb0VHNnBUZS92TFpTZzhXaUY3Y243V3VGNFhsUVMzeUEyVXU4L2NnL1M0b3dxaFFKcDZLL1hnDQo2VW9TQmFkOUtvZzFIOGRlT2ZWOE5tYjhhODl6QjRZZjgvQWVwSWQrTHIvM0k2TzdpdWIrUFVUMlFCWG5rc2ErDQpjZjB5Zis0OUdoeU1DSUxadmN0TlNRZDRWeHI5RWdSdkJBUlRyQWdOUTlzRU9KNm15T3o0aVRGUjdUMnBJRlA4DQpDcDE1ZThqRVZJMXE0SXVIdTNYbHdKTms5ZjVrM2did3J6b3k5UDVyUDh2b1FVM3U5d2g2MkpaYTlVNjNiK3UvDQpVcjF0c0tiNUx4MFlVZWR0SHZwSWlJUnVyRVB4dW1XMHR3anJ4OFRyQWNYUnJWaVNMN2RzWEFvWUMwZFhvMTU0DQpFRThqQkF6Z0lJdXI3dEppenhnWERFbjRpMnB1OFlkNjE1WU1MOWlpNUJvb0VKMmo2ZlEwbnp5UFJteDFFZ3cyDQpGamxnenpjZWFpNFRVT2NhQ0thYjg2eXl1NU1aSXArQmlQUjg0MG53NU1nZ2JSZ1lIMm5GUkJBNzB0b1ZtNFZGDQpsYlpzM3JlR21hSUNtNFNUNlIzOTVPeFlTMWlZQm01a1htOXRMYjRwa0loVXhya2d5dWl3RStEc1djZUJqSEFZDQphWG5DZ1VHS3RpRzl0ZkJNVXczZkNob1BiOUwxeUtkTm9mM3pYRGRUbG9NcUVwTzRCRnJtamNvOGt0MXYwTFVRDQpQaE5abVFQNG5xZDRIcXgyMzg0blBtV0RYYlErZWVQeXhSdGVZR1kwaEplRExWcHllWUc4VlE9PQ0KLS0tLS1FTkQgQ0VSVElGSUNBVEUtLS0tLQ0K"
+pdf_py_ok() { [ -x "$PDF_VENV/bin/python" ] && "$PDF_VENV/bin/python" -I -c 'import pyhanko.sign.pkcs11, pkcs11' >/dev/null 2>&1; }
+nss_has_lib() { have modutil && modutil -dbdir "sql:$NSSDB" -list 2>/dev/null | grep -qF "library name: $1"; }
+nss_has_cca() { have certutil && certutil -d "sql:$NSSDB" -L 2>/dev/null | grep -Eq '^CCA India 2022[[:space:]]+[^[:space:]]*,[^,]*C[^,]*,'; }
+install_pdf_signing() {
+    step "PDF signing (sign-pdf, Document Viewer)"
+    local v w p11 tmp
+    # 1. the signing tool: pyHanko in its own Python environment (from the bundle's wheels when offline)
+    mkdir -p "$PDF_VENV" "$(dirname "$PDF_BIN")"
+    printf '%s' "$SIGNPDF_B64" | base64 -d > "$PDF_PY.tmp" && [ "$(sha "$PDF_PY.tmp")" = "$SIGNPDF_SHA" ] &&
+        mv -f "$PDF_PY.tmp" "$PDF_PY" || { rm -f "$PDF_PY.tmp"; warn "could not write sign_pdf.py"; return 0; }
+    if ! pdf_py_ok; then
+        [ -x "$PDF_VENV/bin/python" ] || python3 -m venv "$PDF_VENV" >/dev/null 2>&1 ||
+            { warn "Python cannot create a virtual environment (Ubuntu: sudo apt install python3-venv) - sign-pdf skipped"; return 0; }
+        w=""; [ -n "$PAYLOAD" ] && [ -d "$PAYLOAD/pdf/wheels" ] && w="$PAYLOAD/pdf/wheels"
+        if [ -n "$w" ] && "$PDF_VENV/bin/pip" install -q --no-index --find-links "$w" "$PYHANKO_REQ" >/dev/null 2>&1; then
+            ok "pyHanko installed from the bundle"
+        elif [ "${OPT_DOWNLOAD:-1}" = 1 ] && "$PDF_VENV/bin/pip" install -q "$PYHANKO_REQ" >/dev/null 2>&1; then
+            ok "pyHanko installed from PyPI"
+        else warn "pyHanko could not be installed (no matching wheels in the bundle and no internet) - sign-pdf will not work yet"; fi
+    fi
+    printf '#!/usr/bin/env bash\n# Sign a PDF with the DSC USB token - see: sign-pdf --help  (railway-dsc-suite)\nexec "%s/bin/python" -I "%s" "$@"\n' \
+        "$PDF_VENV" "$PDF_PY" > "$PDF_BIN"; chmod 755 "$PDF_BIN"
+    mkdir -p "$(dirname "$PDF_DESKTOP")"
+    cat > "$PDF_DESKTOP" <<EOF
+[Desktop Entry]
+Type=Application
+Name=Sign PDF with DSC
+GenericName=Digital signature
+Comment=Sign a PDF with your DSC USB token (asks for the token PIN)
+Exec=$PDF_BIN %f
+TryExec=$PDF_BIN
+Icon=application-certificate
+Terminal=false
+MimeType=application/pdf;
+Categories=Office;
+Keywords=DSC;sign;signature;PDF;token;eSign;
+StartupNotify=false
+EOF
+    have update-desktop-database && update-desktop-database "$(dirname "$PDF_DESKTOP")" >/dev/null 2>&1
+    mkdir -p "$(dirname "$PDF_NAUTILUS")"
+    cat > "$PDF_NAUTILUS" <<EOF
+#!/usr/bin/env bash
+# Files right-click -> Scripts -> Sign PDF with DSC  (railway-dsc-suite)
+IFS=\$'\\n'
+for f in \$NAUTILUS_SCRIPT_SELECTED_FILE_PATHS; do
+  case "\${f,,}" in *.pdf) "$PDF_BIN" "\$f" </dev/null ;; *) zenity --error --no-wrap --text="Not a PDF: \$(basename "\$f")" ;; esac
+done
+EOF
+    chmod 755 "$PDF_NAUTILUS"
+    pdf_py_ok && ok "sign-pdf ready: 'sign-pdf FILE.pdf', the app 'Sign PDF with DSC', or Files right-click > Scripts"
+
+    # 2. Document Viewer (Papers/Evince) signs through NSS: the token's driver and the CCA root in ~/.pki/nssdb
+    if have certutil && have modutil; then
+        mkdir -p "$NSSDB"; [ -f "$NSSDB/cert9.db" ] || certutil -d "sql:$NSSDB" -N --empty-password 2>/dev/null
+        if p11=$(find_p11_lib) && [ -n "$p11" ]; then
+            if nss_has_lib "$p11"; then ok "token driver already registered for Document Viewer ($p11)"
+            elif modutil -dbdir "sql:$NSSDB" -add "DSC token ($(basename "$p11"))" -libfile "$p11" -force >/dev/null 2>&1; then ok "token driver registered for Document Viewer ($p11)"
+            else warn "could not register $p11 in $NSSDB"; fi
+        fi
+        tmp="$(work_tmp)/cca.pem"; printf '%s' "$CCA_ROOT_B64" | base64 -d > "$tmp"
+        if [ "$(cert_fp "$tmp")" != "$CCA_ROOT_SHA256" ]; then warn "embedded CCA root does not match its fingerprint - not trusted"
+        elif nss_has_cca; then ok "CCA India 2022 root trusted for signatures"
+        else certutil -d "sql:$NSSDB" -D -n "CCA India 2022" >/dev/null 2>&1
+             certutil -d "sql:$NSSDB" -A -n "CCA India 2022" -t ",C," -i "$tmp" 2>/dev/null &&
+                 ok "CCA India 2022 root trusted for signatures (DSC signatures show as trusted)" || warn "could not trust the CCA root"; fi
+    else warn "NSS tools (certutil/modutil) missing - Document Viewer cannot see the token"; fi
+    if v=$(pdf_viewer); then ok "PDF viewer with signing: $v"
+        p=$(aa_rules_missing) && warn "AppArmor still blocks the token in ${p#usr.bin.} (it would crash on signed PDFs) - run: railway-dsc install"
+    else warn "no Document Viewer (papers/evince) installed - run: railway-dsc install"; fi
+    return 0
 }
 
 install_eoffice_files() {
@@ -1048,13 +1182,14 @@ ask_eoffice() {               # interactive choice when nothing was chosen yet
 }
 
 cmd_install() {
-    local no_root=0 ui_scale="" pin_scale="" a opt_eoffice=""
+    local no_root=0 ui_scale="" pin_scale="" a opt_eoffice="" opt_pdf=""
     OPT_MSI=""; OPT_ZIP7=""; OPT_DOWNLOAD=1; OPT_CRIS_MSI=""; OPT_IREPS_MSI=""; OPT_KIT=""; OPT_EPASS_ZIP=""
     for a in "$@"; do case "$a" in
         --no-root) no_root=1;; --ui-scale=*) ui_scale="${a#*=}";; --pin-scale=*) pin_scale="${a#*=}";;
         --msi=*) OPT_MSI="${a#*=}";; --zip7=*) OPT_ZIP7="${a#*=}";; --no-download) OPT_DOWNLOAD=0;;
         --cris-msi=*) OPT_CRIS_MSI="${a#*=}";; --ireps-msi=*) OPT_IREPS_MSI="${a#*=}";; --kit=*) OPT_KIT="${a#*=}";;
         --epass-zip=*) OPT_EPASS_ZIP="${a#*=}";;
+        --no-pdf) opt_pdf=no;; --pdf) opt_pdf=yes;;
         --eoffice=*) opt_eoffice="${a#*=}"
             case "$opt_eoffice" in 4|4.1*|7|7.0*|both|all) ;; *) die "--eoffice must be 4, 7 or both";; esac;;
         *) die "unknown option $a";; esac; done
@@ -1064,6 +1199,8 @@ cmd_install() {
         if [ -t 0 ] && [ -t 1 ] && [ "${RDSC_TEST_NOSTART:-}" != 1 ]; then DSC_EOFFICE=$(ask_eoffice); else DSC_EOFFICE=4; fi
     fi
     DSC_EOFFICE="${DSC_EOFFICE:-4}"
+    DSC_PDF=$(sed -n 's/^DSC_PDF=//p' "$CONF_FILE" 2>/dev/null | tail -1); [ -n "$opt_pdf" ] && DSC_PDF="$opt_pdf"
+    case "${DSC_PDF:-yes}" in no|0|off|false) DSC_PDF=no;; *) DSC_PDF=yes;; esac
     [ "$(id -u)" -ne 0 ] || die "Run this as your normal desktop user, not root. It will ask for sudo when needed."
     echo "${B}Railway DSC Signer Suite $SUITE_VERSION - install / repair${N}  (eOffice signer: $(eoffice_desc))"
     case "$(uname -m)" in x86_64) ;; *) warn "CPU $(uname -m): the bundled Java and the mToken driver are x86_64 only; a system or downloaded Java and your token vendor's driver for this CPU are needed.";; esac
@@ -1088,14 +1225,20 @@ cmd_install() {
     if [ -n "$OPT_EPASS_ZIP" ] || plugged_vids | grep -qx 096e; then epass=$(find_epass_zip || true); fi
     [ -n "$OPT_EPASS_ZIP" ] && [ -z "$epass" ] && die "--epass-zip: file not found: $OPT_EPASS_ZIP"
     [ -n "$epass" ] && [ ! -f "$CASTLE_LIB" ] && reasons+=("Feitian ePass2003 driver")
+    local npdf=0
+    if [ "$DSC_PDF" = yes ]; then
+        pdf_viewer >/dev/null || { npdf=1; reasons+=("Document Viewer (Papers) for PDF signing"); }
+        { pdf_py_ok || venv_ok; } || { npdf=1; reasons+=("Python venv for sign-pdf"); }
+        aa_rules_missing >/dev/null && { npdf=1; reasons+=("AppArmor: let Document Viewer use the token"); }
+    fi
 
     if [ ${#reasons[@]} -gt 0 ] && [ $no_root = 0 ] && [ "${RDSC_TEST_NOROOT:-}" != 1 ]; then
         step "Administrator rights needed for: $(IFS=,; echo "${reasons[*]}" | sed 's/,/, /g')"
         if have sudo; then
-            sudo bash "$SELF" __root "$(id -un)" "${PAYLOAD:-/nonexistent}" "$nj8" "$nj17" "$ncab" "$epass" || warn "system-level setup reported a problem - continuing"
+            sudo bash "$SELF" __root "$(id -un)" "${PAYLOAD:-/nonexistent}" "$nj8" "$nj17" "$ncab" "$epass" "$npdf" || warn "system-level setup reported a problem - continuing"
         else
             warn "sudo is not installed. Run this as root, then run install again:"
-            info "su -c 'bash $SELF __root $(id -un) ${PAYLOAD:-/nonexistent} $nj8 $nj17 $ncab $epass'"
+            info "su -c 'bash $SELF __root $(id -un) ${PAYLOAD:-/nonexistent} $nj8 $nj17 $ncab \"$epass\" $npdf'"
             [ -z "$PAYLOAD_TMP" ] || { PAYLOAD_TMP=""; info "(payload kept in $PAYLOAD for that command)"; }
             exit 1
         fi
@@ -1132,12 +1275,15 @@ P11_LIB=""
 # Force a particular Java (leave empty to auto-detect).
 JAVA8=""
 JAVA17=""
+# PDF signing with the token (sign-pdf, Document Viewer): yes or no
+DSC_PDF=$DSC_PDF
 EOF
     else
         [ -n "$ui_scale" ] && conf_set DSC_UI_SCALE "$ui_scale"
         [ -n "$pin_scale" ] && conf_set DSC_EOFFICE_SCALE "$pin_scale"
     fi
     conf_set DSC_EOFFICE "$DSC_EOFFICE"
+    conf_set DSC_PDF "$DSC_PDF"
     # shellcheck disable=SC1090
     . "$CONF_FILE"
     svc_wanted eoffice  && { install_eoffice_files  || true; }
@@ -1187,6 +1333,7 @@ EOF
     refresh_keep
     ok "Repair copies stored ($(wc -l < "$MANIFEST") files, $(du -sh "$KEEP_DIR" | cut -f1))"
     trust_certs
+    [ "$DSC_PDF" = yes ] && install_pdf_signing
     [ "${RDSC_TEST_NOSTART:-}" = 1 ] && return 0
 
     # ---- start and verify -----------------------------------------------------
@@ -1506,6 +1653,19 @@ cmd_doctor() {
     udev_rule_present && d_ok "udev rule for tokens present" || { d_warn "no udev rule - token may need root access"; d_fix "railway-dsc install"; }
     if have systemctl && systemctl is-active --quiet pcscd.socket 2>/dev/null || pgrep -x pcscd >/dev/null 2>&1; then d_ok "pcscd available (smart-card readers)"; fi
 
+    d_head "PDF signing"
+    if [ "${DSC_PDF:-yes}" = no ]; then d_ok "switched off (DSC_PDF=no in suite.conf)"
+    else
+        if o=$(pdf_viewer); then d_ok "Document Viewer: $o"; else d_warn "no PDF viewer that signs (papers/evince)"; d_fix "railway-dsc install"; fi
+        if o=$(aa_rules_missing); then d_fail "AppArmor blocks the token in ${o#usr.bin.}: it crashes when it opens a signed PDF"; d_fix "railway-dsc install   (adds the USB rules to /etc/apparmor.d/local/$o)"
+        elif aa_enabled && [ -n "$(aa_viewer_profiles)" ]; then d_ok "AppArmor lets the viewer use the token"; fi
+        if pdf_py_ok && [ -x "$PDF_BIN" ]; then d_ok "sign-pdf ready ($PDF_BIN)"; else d_warn "sign-pdf not installed or pyHanko missing"; d_fix "railway-dsc install"; fi
+        if j=$(find_p11_lib) && [ -n "$j" ]; then
+            nss_has_lib "$j" && d_ok "token driver registered in ~/.pki/nssdb" || { d_warn "token driver not registered in ~/.pki/nssdb (Document Viewer cannot see the token)"; d_fix "railway-dsc install"; }
+        fi
+        nss_has_cca && d_ok "CCA India 2022 trusted for signatures" || { d_warn "CCA India 2022 not trusted: signatures show 'untrusted issuer'"; d_fix "railway-dsc install"; }
+    fi
+
     d_head "Services"
     have_systemd_user && for u in $LEGACY_UNITS; do
         systemctl --user is-active --quiet "$u.service" 2>/dev/null && { d_fail "old service $u is running"; d_fix "railway-dsc install   (disables it)"; }
@@ -1573,10 +1733,10 @@ cmd_uninstall() {
         local p; p=$(cat "$STATE_DIR/supervisor.pid" 2>/dev/null); [ -n "$p" ] && kill "$p" 2>/dev/null
         for s in $SVCS; do svc_stop "$s"; done
     fi
-    rm -f "$AUTOSTART" "$BIN"
+    rm -f "$AUTOSTART" "$BIN" "$PDF_BIN" "$PDF_DESKTOP" "$PDF_NAUTILUS"
     if [ $purge = 1 ]; then
-        rm -rf "$SHARE_DIR" "$EOFFICE_DIR" "$CRIS_DIR" "$IREPS_DIR" "$CONF_DIR"
-        ok "Services and program files removed. Left in place (need root): $MTOKEN_LIB, $UDEV_RULE, the /etc/hosts line."
+        rm -rf "$SHARE_DIR" "$EOFFICE_DIR" "$CRIS_DIR" "$IREPS_DIR" "$CONF_DIR" "$PDF_VENV"
+        ok "Services and program files removed. Left in place (need root): $MTOKEN_LIB, $UDEV_RULE, the /etc/hosts line, the AppArmor lines in /etc/apparmor.d/local/ and Document Viewer."
     else
         rm -rf "$KEEP_DIR" "$STATE_DIR" "$LAUNCH" "$PROBE"
         ok "Services and watchdog removed; program files and Java runtimes kept (remove too with: uninstall --purge)."
@@ -1600,6 +1760,7 @@ Railway DSC Signer Suite $SUITE_VERSION  -  eOffice (NIC $EOFFICE_VER and/or $E7
                                       built from them with the Linux patch kit (kit/)
                        --ui-scale=N   CRIS/IREPS/7.0.6 window scale (default auto = like the desktop)
                        --pin-scale=N  eOffice 4.1.8 PIN window scale, e.g. 1.5 = 150% (default auto)
+                       --no-pdf       leave out PDF signing (Document Viewer + sign-pdf); --pdf adds it back
                        --no-root      skip the steps that need sudo
                        --no-download  never download a Java runtime
   doctor             explain every problem it can find and how to fix it
@@ -1610,6 +1771,10 @@ Railway DSC Signer Suite $SUITE_VERSION  -  eOffice (NIC $EOFFICE_VER and/or $E7
   trust              (re)add the local signer certificates to browser stores
   pack [FILE]        build a portable installer (.run) from this working machine
   uninstall [--purge]
+
+PDF signing (installed by default):
+  sign-pdf FILE.pdf [--reason R] [--location L] [--page N] [--pos br|bl|tr|tl] [--invisible]
+  or the app "Sign PDF with DSC" / Files right-click > Scripts, or Document Viewer's own signing.
 EOF
 }
 

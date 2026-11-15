@@ -15,6 +15,9 @@ handles Debian/Mint/Pop!_OS, Fedora/RHEL, openSUSE, Arch, Alpine and Void.
 | CrisSigner | `wss://127.0.0.1:2039` | CRIS portals |
 | IREPSSigner | `wss://127.0.0.1:2175` | IREPS |
 
+It also sets up **signing PDFs with the same DSC token** outside the portals (see
+[Signing PDFs](#signing-pdfs)).
+
 ## Quick start on a new PC (Ubuntu)
 
 1. Download this repository (green **Code** button → *Download ZIP*) and unpack it, or
@@ -106,13 +109,38 @@ Java 17 is installed). Like 4.1.8, it is bound to the loopback address only.
 
     railway-dsc doctor      # check everything; explains each problem and its fix
     railway-dsc status      # health of every service, token and watchdog
-    railway-dsc install     # install / repair   (--eoffice=4|7|both, --msi=FILE, --zip7=FILE, --no-root, --no-download)
+    railway-dsc install     # install / repair   (--eoffice=4|7|both, --msi=FILE, --zip7=FILE, --no-pdf, --no-root, --no-download)
     railway-dsc logs        # recent watchdog actions and signer logs
     railway-dsc restart     # restart all signers
     railway-dsc heal        # run the watchdog once now
     railway-dsc trust       # re-add the signer certificates to all browser stores
     railway-dsc pack        # build a portable one-file installer from this machine
     railway-dsc uninstall   # remove services (--purge also removes program files)
+
+## Signing PDFs
+
+`install` also sets up PDF signing with the token (leave it out with `--no-pdf`):
+
+- **Document Viewer (GNOME Papers)** is installed. It signs PDFs itself: open the PDF,
+  choose to add a digital signature, draw the box, enter the token PIN, pick your
+  certificate, then **Save Signed File**.
+- **`sign-pdf`**: `sign-pdf letter.pdf [--reason R] [--location L] [--page N] [--pos br|bl|tr|tl] [--invisible]`
+  writes `letter_signed.pdf` (PAdES, SHA-256, visible box at the bottom right of the last
+  page by default) and checks it with `pdfsig`. The same is available as the app
+  **Sign PDF with DSC** (also under *Open With* for PDFs) and in Files under
+  right-click > *Scripts*. The PIN is asked for each time and never stored.
+
+What the install changes for this:
+
+| Change | Why |
+|---|---|
+| The token's PKCS#11 driver is registered in `~/.pki/nssdb` | Document Viewer finds certificates through NSS |
+| **CCA India 2022** is trusted in `~/.pki/nssdb` for signatures only (`,C,`; fingerprint pinned) | so DSC signatures show as signed by a trusted issuer |
+| A few lines in `/etc/apparmor.d/local/usr.bin.papers` (and `usr.bin.evince`) let the viewer read the USB device tree | Ubuntu's AppArmor profile blocks it; the mToken driver then fails to start libusb and **crashes Document Viewer whenever a signed PDF is opened** |
+| `~/.local/share/dsc-pdfsign` (pyHanko in a Python venv), `~/.local/bin/sign-pdf`, an app entry and a Files script | `sign-pdf` |
+
+A `.run` bundle carries pyHanko as wheels for the packing machine's Python, so the install
+works offline on the same Ubuntu release; on another Python it downloads pyHanko from PyPI.
 
 ## Portable installer for other PCs
 
@@ -182,6 +210,7 @@ Start with `railway-dsc doctor`. Common messages from the portals:
 | "Either Response size is heavy or it is a Browser compatibility issue" | the signer answered with an HTTP error (often 401 Host mismatch, or a crashed PIN window). Run `railway-dsc doctor` |
 | "Mismatch in DSC version" | the portal expects another signer version (e.g. 7.x); check the portal's `dscVersion` |
 | "Please check the signer service: [object Event]" (CRIS/IREPS) | the browser refused the local certificate. Run `railway-dsc trust`; in Firefox also open `https://127.0.0.1:2039` once and accept |
+| Document Viewer closes as soon as a signed PDF is opened | AppArmor blocks the token driver. Run `railway-dsc install` (or see `railway-dsc doctor`, section *PDF signing*) |
 
 Don't click **Register DSC** repeatedly while debugging: each click deactivates the
 currently active registration.
@@ -234,5 +263,9 @@ installers, from a `.run` bundle you build yourself, or from an existing install
   - the Temurin download lookup;
   - the generated launcher on a spare port (loopback-only binding, probe, CA-verified HTTPS);
   - `doctor` against the live services.
+- PDF signing (4.6.0): Document Viewer stopped crashing on signed PDFs once the AppArmor
+  lines were added; `sign-pdf` and the bundle's offline pyHanko install were tested with a
+  throwaway certificate in a throwaway home. Signing with a real token and PIN, through
+  `sign-pdf` or Document Viewer, has not been tried yet.
 - Not yet tested: the sudo phase on non-Ubuntu distributions, and the non-systemd
   supervisor running real services.
