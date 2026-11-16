@@ -38,7 +38,7 @@
 set -u
 set -o pipefail
 
-SUITE_VERSION="4.6.0"
+SUITE_VERSION="4.6.1"
 MARKER="__PAYLOAD_BELOW__"
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
 
@@ -313,6 +313,42 @@ probe() {
     if [ "$(svc_kind "$1")" = http ]; then python3 "$PROBE" http "$(svc_port "$1")" "$(hosts_addr || true)" "$HOSTS_NAME" >/dev/null 2>&1
     else python3 "$PROBE" ws "$(svc_port "$1")" >/dev/null 2>&1; fi
 }
+# --- Can a signer still open its PIN window? A signer can answer on its port and still be
+# useless: Java binds to one X display the first time it draws, and if that display goes away
+# (or was never usable) every signing request fails with "Could not initialize class
+# sun.awt.X11GraphicsEnvironment" - which eOffice shows as "Response size is heavy or browser
+# compatibility issue". Only a fresh start fixes it.
+AWT_DEAD='Can.t connect to X11 window server|Could not initialize class sun[.]awt[.]X11GraphicsEnvironment'
+x11_ok() { ensure_probe; [ -n "$1" ] && python3 -I "$PROBE" x11 "$1" "${2:-}" >/dev/null 2>&1; }
+proc_env() { tr '\0' '\n' < "/proc/$1/environ" 2>/dev/null | sed -n "s/^$2=//p" | head -n 1; }
+session_display() {          # the desktop's display, if it accepts us now; prints DISPLAY
+    local d="" a=""
+    if have_systemd_user; then
+        local env; env=$(systemctl --user show-environment 2>/dev/null)
+        d=$(printf '%s\n' "$env" | sed -n 's/^DISPLAY=//p'); a=$(printf '%s\n' "$env" | sed -n 's/^XAUTHORITY=//p')
+    fi
+    [ -n "$d" ] || { d="${DISPLAY:-}"; a="${XAUTHORITY:-}"; }
+    x11_ok "$d" "$a" && echo "$d"
+}
+svc_run_log() {              # this run's log output (everything after the launcher's start marker)
+    local s=$1 p=$2 f
+    if [ "$s" = eoffice ] || [ "$s" = eoffice7 ]; then
+        for f in "$(svc_logdir "$s")"/*.log; do [ -f "$f" ] && after_marker "$p" < "$f"; done
+    elif have_systemd_user && have journalctl; then
+        journalctl --user -u "$(svc_unit "$s").service" "_PID=$p" -o cat --no-pager 2>/dev/null
+    else after_marker "$p" < "$SHARE_DIR/$s.log" 2>/dev/null; fi
+}
+svc_logdir() { case "$1" in eoffice) echo "$EOFFICE_LOGS";; eoffice7) echo "$E7_LOGS";; esac; }
+after_marker() { awk -v m=" pid $1 " 'index($0, "=== railway-dsc: started ") { f = index($0, m) > 0; next } f'; }
+svc_gui_problem() {          # prints why the signer cannot show its PIN window; fails if it can
+    local p d a; p=$(svc_pid "$1")
+    [ -n "$p" ] && [ "$p" != 0 ] && [ -r "/proc/$p/environ" ] || return 1
+    d=$(proc_env "$p" DISPLAY); a=$(proc_env "$p" XAUTHORITY)
+    if [ -z "$d" ]; then echo "it was started without a display"; return 0; fi
+    if ! x11_ok "$d" "$a"; then echo "its display $d is no longer usable"; return 0; fi
+    if svc_run_log "$1" "$p" | grep -Eq "$AWT_DEAD"; then echo "Java failed to open its PIN window earlier and cannot recover"; return 0; fi
+    return 1
+}
 port_owner() { ss -ltnpH "sport = :$1" 2>/dev/null | sed -n 's/.*users:((\("[^"]*",pid=[0-9]*\).*/\1/p' | head -1; }
 
 ensure_supervisor() {         # non-systemd systems only
@@ -330,7 +366,7 @@ write_probe() {
     cat > "$PROBE" <<'PY'
 #!/usr/bin/env python3
 """Functional health probe: exit 0 only if the signer really answers.
-usage: probe.py http PORT [ADDR] [HOSTNAME]   |   probe.py ws PORT"""
+usage: probe.py http PORT [ADDR] [HOSTNAME]  |  probe.py ws PORT  |  probe.py x11 DISPLAY [XAUTHORITY]"""
 import base64, os, socket, ssl, sys
 
 def tls(addr, port, sni):
@@ -383,8 +419,79 @@ def ws(port):
         except Exception:
             pass
 
+def xauth_cookies(path, num):
+    """MIT-MAGIC-COOKIE-1 entries for display number `num`, best match first."""
+    out = []
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError:
+        return out
+    host = socket.gethostname().encode()
+    i = 0
+    def field():
+        nonlocal i
+        n = int.from_bytes(data[i:i + 2], "big")
+        v = data[i + 2:i + 2 + n]
+        i += 2 + n
+        return v
+    try:
+        while i + 2 <= len(data):
+            fam = int.from_bytes(data[i:i + 2], "big"); i += 2
+            addr, number, name, cookie = field(), field(), field(), field()
+            if name != b"MIT-MAGIC-COOKIE-1" or number not in (num.encode(), b""):
+                continue
+            rank = 0 if (fam == 256 and addr == host) else 1 if fam == 65535 else 2
+            out.append((rank, cookie))
+    except Exception:
+        pass
+    return [c for _, c in sorted(out, key=lambda t: t[0])]
+
+def x11_hello(display, cookie):
+    host, _, rest = display.rpartition(":")
+    num = rest.split(".")[0]
+    if host in ("", "unix"):
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(5)
+        try:
+            s.connect("/tmp/.X11-unix/X" + num)
+        except OSError:
+            s.close()
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.settimeout(5)
+            s.connect("\0/tmp/.X11-unix/X" + num)        # Linux abstract socket
+    else:
+        s = socket.create_connection((host, 6000 + int(num)), timeout=5)
+    try:
+        name = b"MIT-MAGIC-COOKIE-1" if cookie is not None else b""
+        data = cookie or b""
+        pad = lambda b: b + b"\0" * (-len(b) % 4)
+        s.sendall(b"l\0" + (11).to_bytes(2, "little") + (0).to_bytes(2, "little")
+                  + len(name).to_bytes(2, "little") + len(data).to_bytes(2, "little")
+                  + b"\0\0" + pad(name) + pad(data))
+        reply = s.recv(8)
+        return bool(reply) and reply[0] == 1         # 1 = Success, 0 = Failed, 2 = Authenticate
+    finally:
+        s.close()
+
+def x11(display, xauthority):
+    """Can a client with this DISPLAY/XAUTHORITY open the X server? (what a PIN window needs)"""
+    if not display or ":" not in display:
+        return False
+    num = display.rpartition(":")[2].split(".")[0]
+    cookies = xauth_cookies(xauthority or os.path.expanduser("~/.Xauthority"), num)
+    for c in cookies + [None]:
+        try:
+            if x11_hello(display, c):
+                return True
+        except (OSError, ValueError):
+            return False
+    return False
+
 if __name__ == "__main__":
     try:
+        if sys.argv[1] == "x11":
+            sys.exit(0 if x11(sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else "") else 1)
         kind, port = sys.argv[1], int(sys.argv[2])
         if kind == "http":
             addr = sys.argv[3] if len(sys.argv) > 3 and sys.argv[3] else "127.0.0.1"
@@ -428,7 +535,7 @@ write_launcher() {
         echo '# usage: launch.sh eoffice|cris|ireps'
         local v
         for v in U_HOME LAF_JAR SCALE_JAR E7_DIR E7_JAR E7_LOGS EOFFICE_DIR EOFFICE_JAR EOFFICE_JKS EOFFICE_LOGS CRIS_DIR IREPS_DIR CONF_FILE \
-                 JRE8_DIR JRE17_DIR LEGACY_706_DIR HOSTS_NAME P11_CANDIDATES OPENSC_LIBS MTOKEN_LIB; do
+                 JRE8_DIR JRE17_DIR LEGACY_706_DIR HOSTS_NAME P11_CANDIDATES OPENSC_LIBS MTOKEN_LIB PROBE; do
             printf '%s=%q\n' "$v" "${!v}"
         done
         declare -f java_major java_has_gui find_java8 find_java_modern find_p11_lib plugged_vids p11_for_vid
@@ -439,28 +546,48 @@ DSC_UI_SCALE=auto; DSC_EOFFICE_SCALE=auto; DSC_LOOK=native; P11_LIB=""; JAVA8=""
 [ -f "$CONF_FILE" ] && . "$CONF_FILE"
 
 # --- Display: these are Swing apps and the PIN prompt needs an X display -------
-if [ -z "${DISPLAY:-}" ] && command -v systemctl >/dev/null 2>&1; then
-    DISPLAY=$(systemctl --user show-environment 2>/dev/null | sed -n 's/^DISPLAY=//p')
-fi
-if [ -z "${DISPLAY:-}" ]; then
-    for s in /tmp/.X11-unix/X*; do [ -S "$s" ] && { DISPLAY=":${s##*/X}"; break; }; done
-fi
-[ -n "${DISPLAY:-}" ] || { echo "No X display yet - will retry."; exit 1; }
-export DISPLAY
-if [ -z "${XAUTHORITY:-}" ]; then
-    XA=""
-    command -v systemctl >/dev/null 2>&1 && XA=$(systemctl --user show-environment 2>/dev/null | sed -n 's/^XAUTHORITY=//p')
-    if [ -z "$XA" ]; then
-        for f in /run/user/$(id -u)/.mutter-Xwaylandauth.* /run/user/$(id -u)/xauth_* "$HOME/.Xauthority"; do
-            [ -f "$f" ] && { XA="$f"; break; }
-        done
+# Java fixes its display the first time it draws a window and never recovers if that fails, so
+# only start on a display that really accepts us. The inherited DISPLAY can be a stale one from
+# the moment the login was still settling (seen: ":1024" without XAUTHORITY), so the desktop
+# session's current values are tried first; every candidate is checked with a real X handshake.
+x_works() {   # DISPLAY XAUTHORITY
+    if command -v python3 >/dev/null 2>&1 && [ -f "$PROBE" ]; then
+        python3 -I "$PROBE" x11 "$1" "$2" >/dev/null 2>&1
+    else local n="${1#*:}"; n="${n%%.*}"; [ -n "$1" ] && [ -S "/tmp/.X11-unix/X$n" ]; fi
+}
+guess_xauth() {
+    local f
+    for f in /run/user/$(id -u)/.mutter-Xwaylandauth.* /run/user/$(id -u)/xauth_* "$HOME/.Xauthority"; do
+        [ -f "$f" ] && { echo "$f"; return; }
+    done
+}
+pick_display() {
+    local env d a s
+    if command -v systemctl >/dev/null 2>&1; then
+        env=$(systemctl --user show-environment 2>/dev/null)
+        d=$(printf '%s\n' "$env" | sed -n 's/^DISPLAY=//p'); a=$(printf '%s\n' "$env" | sed -n 's/^XAUTHORITY=//p')
+        [ -n "$d" ] && x_works "$d" "${a:-$(guess_xauth)}" && { DISPLAY="$d"; XAUTHORITY="${a:-$(guess_xauth)}"; return 0; }
     fi
-    [ -n "$XA" ] && export XAUTHORITY="$XA"
-fi
-dnum="${DISPLAY#*:}"; dnum="${dnum%%.*}"
+    if [ -n "$IN_DISPLAY" ]; then
+        a="${IN_XAUTHORITY:-$(guess_xauth)}"
+        x_works "$IN_DISPLAY" "$a" && { DISPLAY="$IN_DISPLAY"; XAUTHORITY="$a"; return 0; }
+    fi
+    a="${IN_XAUTHORITY:-$(guess_xauth)}"
+    for s in /tmp/.X11-unix/X*; do
+        [ -S "$s" ] && x_works ":${s##*/X}" "$a" && { DISPLAY=":${s##*/X}"; XAUTHORITY="$a"; return 0; }
+    done
+    return 1
+}
+IN_DISPLAY="${DISPLAY:-}"; IN_XAUTHORITY="${XAUTHORITY:-}"
+# exec keeps the PID, so the watchdog reads "this run's" log as everything after this line
+started_marker() { echo "=== railway-dsc: started $SVC pid $$ display ${DISPLAY:-?} $(date '+%F %T')"; }
 i=0
-while [ ! -S "/tmp/.X11-unix/X$dnum" ] && [ $i -lt 30 ]; do sleep 2; i=$((i+1)); done
-[ -S "/tmp/.X11-unix/X$dnum" ] || { echo "X display $DISPLAY not available - will retry."; exit 1; }
+until pick_display; do
+    i=$((i+1)); [ $i -ge 30 ] && { echo "No working X display yet - will retry."; exit 1; }
+    sleep 2
+done
+export DISPLAY
+if [ -n "${XAUTHORITY:-}" ]; then export XAUTHORITY; else unset XAUTHORITY; fi
 
 # Ubuntu's Java ships an accessibility.properties naming the GNOME ATK bridge; when that
 # bridge is not installed every Swing window (incl. the PIN prompt) dies with AWTError.
@@ -497,6 +624,7 @@ if [ "$SVC" = eoffice7 ]; then
         printf 'service.start=false\nservice.locale=en_in\nprocess.type=custom\nselected.token.name=%s\nselected.token.path=%s\nused.token.name=%s\nused.token.path=%s\n' "$T" "$P11" "$T" "$P11" > conf/default_token.properties
     fi
     exec >>"$E7_LOGS/output.log" 2>>"$E7_LOGS/errorOutput.log"
+    started_marker; started_marker >&2
     # java.awt.headless=true is what NIC's own launcher passes; the app switches it back itself.
     exec "$J" "$NOATK" "${UI[@]}" -Djava.awt.headless=true -jar "$E7_JAR" --server.address="$BIND"
 fi
@@ -509,6 +637,7 @@ if [ "$SVC" = eoffice ]; then
         printf 'name = DSCToken\nlibrary = %s\n' "$P11" > pkcs11cfg
     fi
     exec >>"$EOFFICE_LOGS/output.log" 2>>"$EOFFICE_LOGS/error.log"
+    started_marker; started_marker >&2
     # Java 8 cannot scale Swing on Linux: the scaling agent enlarges NIC's PIN window instead.
     case "$DSC_EOFFICE_SCALE" in ""|auto) ES="$DSC_UI_SCALE";; *) ES="$DSC_EOFFICE_SCALE";; esac
     AGENT=()
@@ -535,6 +664,7 @@ OPTS=("$NOATK" "-Djava.util.Arrays.useLegacyMergeSort=true" "${UI[@]}"
 P11=$(find_p11_lib) && OPTS+=("-Dwebsigner.pkcs11.library=$P11")
 CP="$APP_DIR/lib/windows-laf-stub.jar:$APP_DIR/lib/windowslookandfell-stub.jar:$APP_DIR/$APP_JAR:$APP_DIR/lib/*"
 [ "$DSC_LOOK" = native ] && [ -f "$LAF_JAR" ] && CP="$LAF_JAR:$CP"      # first on the path wins
+started_marker
 exec "$JAVA_BIN" "${OPTS[@]}" -cp "$CP" server.ServerUI
 LAUNCH_EOF
     chmod 755 "$LAUNCH"
@@ -1441,7 +1571,11 @@ heal_once() {
         if [ -z "$why" ]; then
             if ! svc_active "$s"; then why="not running"
             elif [ "$(svc_age "$s")" -lt 60 ]; then rm -f "$STATE_DIR/fail.$s"; continue      # still starting
-            elif probe "$s"; then rm -f "$STATE_DIR/fail.$s"; continue
+            elif probe "$s"; then
+                rm -f "$STATE_DIR/fail.$s"
+                # answering, but can it still open its PIN window? Restart only when a working
+                # desktop display exists now - otherwise a restart cannot help (e.g. logged out).
+                why=$(svc_gui_problem "$s") && [ -n "$(session_display)" ] || continue
             else
                 cnt=$(( $(cat "$STATE_DIR/fail.$s" 2>/dev/null || echo 0) + 1 ))
                 if [ "$cnt" -lt 2 ]; then
@@ -1549,7 +1683,7 @@ d_head() { echo; echo "${B}$*${N}"; }
 cmd_doctor() {
     echo "${B}Railway DSC Signer Suite $SUITE_VERSION - doctor${N}  ($(date '+%F %T'))"
     [ -f "$CONF_FILE" ] && . "$CONF_FILE"
-    local s j f u o e
+    local s j f u o e why
 
     d_head "System"
     if [ -f /etc/os-release ]; then . /etc/os-release; d_ok "${PRETTY_NAME:-unknown Linux}, kernel $(uname -r), $(uname -m)"; fi
@@ -1558,6 +1692,8 @@ cmd_doctor() {
     if [ -n "${WAYLAND_DISPLAY:-}" ]; then d_ok "Wayland session (signers use XWayland - fine)"; fi
     if ls /tmp/.X11-unix/X* >/dev/null 2>&1; then d_ok "X display socket present ($(ls /tmp/.X11-unix | tr '\n' ' '))"
     else d_fail "no X display socket - the signers' PIN window cannot open"; d_fix "log in to a graphical desktop session"; fi
+    if o=$(session_display) && [ -n "$o" ]; then d_ok "desktop display $o accepts windows from the signers"
+    else d_warn "the desktop display does not accept connections right now (no graphical login?)"; fi
     for f in python3 certutil ss unzip; do have "$f" || { d_warn "'$f' missing"; d_fix "railway-dsc install (installs it)"; }; done
 
     d_head "Java"
@@ -1684,8 +1820,11 @@ cmd_doctor() {
     hook_active && { d_fail "vendor login-shell hook $VENDOR_HOOK is active (starts/kills signers at every login)"; d_fix "railway-dsc install"; }
     for s in $SVCS; do
         if ! svc_active "$s"; then d_fail "$(svc_label "$s") not running"; d_fix "railway-dsc restart; then: railway-dsc logs"
-        elif probe "$s"; then d_ok "$(svc_label "$s") answers on port $(svc_port "$s")"
-        else d_warn "$(svc_label "$s") running but not answering"; d_fix "railway-dsc heal"; fi
+        elif ! probe "$s"; then d_warn "$(svc_label "$s") running but not answering"; d_fix "railway-dsc heal"
+        elif why=$(svc_gui_problem "$s"); then
+            d_fail "$(svc_label "$s") answers on port $(svc_port "$s") but cannot open its PIN window: $why"
+            d_fix "railway-dsc restart   (the watchdog also does this within 3 minutes)"
+        else d_ok "$(svc_label "$s") answers on port $(svc_port "$s") and can open its PIN window"; fi
     done
     if have_systemd_user; then systemctl --user is-active --quiet railway-dsc-heal.timer && d_ok "watchdog timer active" || { d_warn "watchdog timer not active"; d_fix "railway-dsc install"; }; fi
     if [ -f "$EOFFICE_LOGS/error.log" ] && grep -q 'AWTError\|Assistive Technology' "$EOFFICE_LOGS/error.log" 2>/dev/null; then

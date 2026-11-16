@@ -192,6 +192,15 @@ NIC's jar is never modified. Everything is done around it:
 - A watchdog runs every 3 minutes. It asks each port for a real answer (HTTPS
   `isLive` with the right Host header, or a WebSocket handshake) and restarts a
   service after two failed checks.
+- It also checks that each signer can still open its PIN window. A signer that
+  started while the login was still settling can keep a display that later
+  disappears. It still answers on its port, but every signing fails ("Could not
+  initialize class sun.awt.X11GraphicsEnvironment" in its log), and Java cannot
+  recover from that by itself. The watchdog does a real X handshake with the
+  signer's own `DISPLAY`/`XAUTHORITY`, looks for that Java error in the signer's
+  log for its current run, and restarts the signer when either check fails and
+  the desktop display works. The launcher also only starts a signer on a display
+  that passes the same handshake.
 - Damaged or missing program files are restored from a kept copy.
 - Duplicate signer instances and resurrected legacy services are removed.
 - Missing service definitions are rewritten, and logs over 20 MB are rotated.
@@ -207,7 +216,7 @@ Start with `railway-dsc doctor`. Common messages from the portals:
 | Message | Meaning |
 |---|---|
 | "Unable to connect with DSC service application. Verify Network." | nothing is answering on 55101. Run `railway-dsc status` |
-| "Either Response size is heavy or it is a Browser compatibility issue" | the signer answered with an HTTP error (often 401 Host mismatch, or a crashed PIN window). Run `railway-dsc doctor` |
+| "Either Response size is heavy or it is a Browser compatibility issue" | the signer answered with an HTTP error: often a 401 Host mismatch, or a PIN window that cannot open because the signer lost its display (doctor: "cannot open its PIN window"; fixed by `railway-dsc restart`, and by the watchdog within 3 minutes). Run `railway-dsc doctor` |
 | "Mismatch in DSC version" | the portal expects another signer version (e.g. 7.x); check the portal's `dscVersion` |
 | "Please check the signer service: [object Event]" (CRIS/IREPS) | the browser refused the local certificate. Run `railway-dsc trust`; in Firefox also open `https://127.0.0.1:2039` once and accept |
 | Document Viewer closes as soon as a signed PDF is opened | AppArmor blocks the token driver. Run `railway-dsc install` (or see `railway-dsc doctor`, section *PDF signing*) |
@@ -267,5 +276,10 @@ installers, from a `.run` bundle you build yourself, or from an existing install
   lines were added; `sign-pdf` and the bundle's offline pyHanko install were tested with a
   throwaway certificate in a throwaway home. Signing with a real token and PIN, through
   `sign-pdf` or Document Viewer, has not been tried yet.
+- Display check (4.6.1): the X handshake probe accepted the session display and rejected
+  a vanished display (`:1024`), a missing cookie and a missing auth file; the watchdog
+  (dry run) chose to restart a signer on `:1024` and did nothing when no desktop display
+  worked; the launcher picked the session display over an inherited stale one. Found
+  when eOffice signing failed with the message above after a re-login on 2026-11-15.
 - Not yet tested: the sudo phase on non-Ubuntu distributions, and the non-systemd
   supervisor running real services.
