@@ -439,30 +439,38 @@ def xauth_cookies(path, num):
         while i + 2 <= len(data):
             fam = int.from_bytes(data[i:i + 2], "big"); i += 2
             addr, number, name, cookie = field(), field(), field(), field()
+            # an empty number means "any display" (mutter writes its Xwayland cookie that way)
             if name != b"MIT-MAGIC-COOKIE-1" or number not in (num.encode(), b""):
                 continue
-            rank = 0 if (fam == 256 and addr == host) else 1 if fam == 65535 else 2
+            rank = (0 if (fam == 256 and addr == host) else 1 if fam == 65535 else 2) + (0 if number else 3)
             out.append((rank, cookie))
     except Exception:
         pass
     return [c for _, c in sorted(out, key=lambda t: t[0])]
 
-def x11_hello(display, cookie):
+def x11_socket(display):
+    """Path of a local display socket we may trust with our cookie, else None.
+    /tmp/.X11-unix is world-writable and abstract sockets can be taken by anyone, so only
+    a filesystem socket owned by root (Xorg) or by us (Xwayland) is accepted; never TCP."""
     host, _, rest = display.rpartition(":")
     num = rest.split(".")[0]
-    if host in ("", "unix"):
-        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        s.settimeout(5)
-        try:
-            s.connect("/tmp/.X11-unix/X" + num)
-        except OSError:
-            s.close()
-            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            s.settimeout(5)
-            s.connect("\0/tmp/.X11-unix/X" + num)        # Linux abstract socket
-    else:
-        s = socket.create_connection((host, 6000 + int(num)), timeout=5)
+    if host not in ("", "unix") or not num.isdigit():
+        return None
+    path = "/tmp/.X11-unix/X" + num
     try:
+        st = os.lstat(path)
+    except OSError:
+        return None
+    import stat
+    if not stat.S_ISSOCK(st.st_mode) or st.st_uid not in (0, os.getuid()):
+        return None
+    return path
+
+def x11_hello(path, cookie):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(5)
+    try:
+        s.connect(path)
         name = b"MIT-MAGIC-COOKIE-1" if cookie is not None else b""
         data = cookie or b""
         pad = lambda b: b + b"\0" * (-len(b) % 4)
@@ -476,13 +484,14 @@ def x11_hello(display, cookie):
 
 def x11(display, xauthority):
     """Can a client with this DISPLAY/XAUTHORITY open the X server? (what a PIN window needs)"""
-    if not display or ":" not in display:
+    path = x11_socket(display or "") if display and ":" in display else None
+    if not path:
         return False
     num = display.rpartition(":")[2].split(".")[0]
     cookies = xauth_cookies(xauthority or os.path.expanduser("~/.Xauthority"), num)
-    for c in cookies + [None]:
+    for c in cookies + [None]:          # None: servers without access control (xhost)
         try:
-            if x11_hello(display, c):
+            if x11_hello(path, c):
                 return True
         except (OSError, ValueError):
             return False
@@ -553,7 +562,11 @@ DSC_UI_SCALE=auto; DSC_EOFFICE_SCALE=auto; DSC_LOOK=native; P11_LIB=""; JAVA8=""
 x_works() {   # DISPLAY XAUTHORITY
     if command -v python3 >/dev/null 2>&1 && [ -f "$PROBE" ]; then
         python3 -I "$PROBE" x11 "$1" "$2" >/dev/null 2>&1
-    else local n="${1#*:}"; n="${n%%.*}"; [ -n "$1" ] && [ -S "/tmp/.X11-unix/X$n" ]; fi
+    else
+        local n="${1#*:}" o; n="${n%%.*}"
+        [ -n "$1" ] && [ -S "/tmp/.X11-unix/X$n" ] && o=$(stat -c %u "/tmp/.X11-unix/X$n" 2>/dev/null) \
+            && { [ "$o" = 0 ] || [ "$o" = "$(id -u)" ]; }
+    fi
 }
 guess_xauth() {
     local f
@@ -562,16 +575,20 @@ guess_xauth() {
     done
 }
 pick_display() {
-    local env d a s
+    local env="" d="" a="" s
     if command -v systemctl >/dev/null 2>&1; then
         env=$(systemctl --user show-environment 2>/dev/null)
         d=$(printf '%s\n' "$env" | sed -n 's/^DISPLAY=//p'); a=$(printf '%s\n' "$env" | sed -n 's/^XAUTHORITY=//p')
         [ -n "$d" ] && x_works "$d" "${a:-$(guess_xauth)}" && { DISPLAY="$d"; XAUTHORITY="${a:-$(guess_xauth)}"; return 0; }
     fi
+    local named="$d"
     if [ -n "$IN_DISPLAY" ]; then
         a="${IN_XAUTHORITY:-$(guess_xauth)}"
         x_works "$IN_DISPLAY" "$a" && { DISPLAY="$IN_DISPLAY"; XAUTHORITY="$a"; return 0; }
     fi
+    # Guess from the socket folder only when nobody named a display (no session manager);
+    # a named display that does not answer yet is retried instead.
+    [ -n "$named$IN_DISPLAY" ] && return 1
     a="${IN_XAUTHORITY:-$(guess_xauth)}"
     for s in /tmp/.X11-unix/X*; do
         [ -S "$s" ] && x_works ":${s##*/X}" "$a" && { DISPLAY=":${s##*/X}"; XAUTHORITY="$a"; return 0; }
