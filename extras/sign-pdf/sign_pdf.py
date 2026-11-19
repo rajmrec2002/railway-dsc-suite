@@ -24,7 +24,11 @@ from pyhanko.stamp import TextStampStyle
 OPENSC = ["/usr/lib/x86_64-linux-gnu/opensc-pkcs11.so", "/usr/lib/x86_64-linux-gnu/pkcs11/opensc-pkcs11.so"]
 DRIVERS = {  # USB vendor id -> PKCS#11 drivers, best first (mirrors railway-dsc's p11_for_vid)
     "055c": ["/usr/lib/libcryptoid_pkcs11.so", "/usr/lib/libmTokenPKCS11.so"],
-    "096e": ["/usr/lib/libcastle.so.1.0.0", "/usr/lib/libcastle.so", "/usr/lib/x86_64-linux-gnu/libcastle.so"] + OPENSC,
+    "096e": ["/usr/lib/libcastle.so.1.0.0", "/usr/lib/railway-dsc/feitian/libcastle_v2.so.1.0.0", "/usr/lib/libcastle.so",
+             "/usr/lib/x86_64-linux-gnu/libcastle.so"] + OPENSC,
+    "2ccf": ["/usr/lib/railway-dsc/hypersecu/libcastle_v2.so.1.0.0", "/usr/lib/libcastle_v2.so.1.0.0"],
+    "338c": ["/usr/lib/railway-dsc/innait/libInnaITPKCS11Driver.so",
+             "/opt/Precision_Biometric/InnaITDSC/libraries/libInnaITPKCS11Driver.so"],
     "163c": ["/usr/lib/WatchData/ProxKey/lib/libwdpkcs_SignatureP11.so", "/usr/lib/WatchData/TRUSTKEY/lib/libwdpkcs_TRUSTKEY.so",
              "/usr/lib/WatchData/eMudhra_3.4.3/lib/libwdpkcs_eMudhra_343.so", "/usr/lib/WatchData/PROXKey/lib/libwdpkcs.so",
              "/usr/lib/libwdpkcs.so"],
@@ -213,12 +217,13 @@ def main():
     try:
         import pkcs11
         from asn1crypto import x509
-        key_ids = {k.id for k in session.get_objects({pkcs11.Attribute.CLASS: pkcs11.ObjectClass.PRIVATE_KEY})}
+        key_ids = {k[pkcs11.Attribute.ID] for k in session.get_objects({pkcs11.Attribute.CLASS: pkcs11.ObjectClass.PRIVATE_KEY})}
         mine = []
         for c in session.get_objects({pkcs11.Attribute.CLASS: pkcs11.ObjectClass.CERTIFICATE}):
             cert = x509.Certificate.load(c[pkcs11.Attribute.VALUE])
-            if c.id in key_ids and not is_ca(cert):
-                mine.append((c.id, cert))
+            cid = c[pkcs11.Attribute.ID]          # Certificate objects have no .id property (only keys do)
+            if cid in key_ids and not is_ca(cert):
+                mine.append((cid, cert))
         if not mine:
             fail("no signing certificate with a private key on this token")
         mine.sort(key=lambda t: t[1].not_valid_after, reverse=True)      # several: the one valid longest

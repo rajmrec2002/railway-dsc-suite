@@ -70,19 +70,37 @@ driver that matches the **token plugged in** (checked whenever a signer starts):
 | Token (USB vendor) | Driver used | Status |
 |---|---|---|
 | Longmai **mToken** CryptoID (055c) | `/usr/lib/libcryptoid_pkcs11.so` (in the `.run` bundle) | tested |
-| Feitian **ePass2003 / ePass2003 Auto**, HYP2003 (096e) | Feitian's `libcastle.so.1.0.0` if installed, otherwise **OpenSC** (installed automatically, open source; supports the ePass2003) | not tested with a real token |
-| WatchData **ProxKey** / TrustKey (163c) | WatchData's `libwdpkcs_*` if installed | not tested; see below |
+| Feitian **ePass2003 / ePass2003 Auto** (096e) | Feitian's `libcastle.so.1.0.0` or eMudhra's `libcastle_v2.so.1.0.0` if available, otherwise **OpenSC** (installed automatically, open source) | not tested with a real token |
+| **Hypersecu HYP2003** (2ccf:080a) | Hypersecu's own `libcastle_v2.so.1.0.0` (OpenSC does not drive it); the suite adds the token to the smart-card reader list | reported working on one PC with manual steps; suite automation not tested with a real token |
+| Precision **InnaIT KeyDSC** (338c) | Precision's `libInnaITPKCS11Driver.so`; the suite adds the token to the smart-card reader list | not tested with a real token |
+| WatchData **ProxKey** / TrustKey (163c) | WatchData's `libwdpkcs_SignatureP11.so`, run against Ubuntu's own smart-card service | not tested with a real token; see below |
 | SafeNet eToken (0529), Gemalto/Thales IDPrime (08e6), JaCarta (24dc), smart-card readers | vendor driver if installed; OpenSC for Gemalto cards and readers | not tested |
 
-- **Feitian's own ePass2003 driver:** `railway-dsc install --epass-zip=ePass2003-Linux-x64.zip`.
-  Only the library is installed; Feitian's scripts, which edit hotplug files, are not run.
-  A zip already in `~/Downloads` is used automatically when an ePass2003 is plugged in.
-- **WatchData ProxKey:** install WatchData's Ubuntu package from your supplier (e.g. the
-  ProxKey support site). It is not automated: WatchData's installer adds its own
-  smart-card daemon, a login hook and a world-writable folder, and its driver needs
-  `libxml2.so.2`, which Ubuntu 26.04 no longer ships.
-- **Two different tokens:** the first one plugged in wins. Set `P11_LIB=/path/to/driver.so`
-  in `~/.config/railway-dsc/suite.conf` to force one, then `railway-dsc restart`.
+**Vendor drivers.** Download the Linux driver from the
+[eMudhra repository](https://www.e-mudhra.com/Repository/) (Token Drivers: `ePass2003_Linux.zip`,
+`ProxKey_Linux.zip`, Precision InnaIT `InnaITDSC_Setup.zip`), or get Hypersecu's
+`HYP2003-Linux-x86_64-FIPS140-3.zip` from [hypersecu.com/india-support](https://www.hypersecu.com/india-support). Leave it in `~/Downloads` and run `railway-dsc install`.
+The private `.run` bundle already carries the known builds.
+
+- Only the PKCS#11 library is taken, after its SHA-256 is checked against the builds the suite
+  knows. The vendors' installers are **not** run: they add world-writable udev rules, init
+  scripts, autostart entries or their own smart-card daemon. A build the suite does not know
+  is used only when named: `railway-dsc install --driver=FILE` (`--epass-zip=FILE` still works).
+- Drivers are installed to `/usr/lib/railway-dsc/<vendor>/` (ProxKey:
+  `/usr/lib/WatchData/ProxKey/lib/`), so clearing `~/Downloads` does not break them.
+- **Hypersecu / InnaIT:** Ubuntu's CCID driver does not list these tokens yet, so the suite adds
+  their USB ids to `ifd-ccid.bundle/Contents/Info.plist` (backup `Info.plist.bak-railway-dsc`) and
+  restarts `pcscd`. A `libccid` package update undoes this; `railway-dsc doctor` notices, and
+  `railway-dsc install` adds them again.
+- **ProxKey:** the driver expects WatchData's own copy of pcsc-lite and the old `libxml2.so.2`.
+  The suite puts two links in `/usr/lib/WatchData/pcsc/` (the driver's built-in library path,
+  so nothing else on the system is affected): to the system `libpcsclite.so.1`, and to
+  `libxml2.so.16`, which still has the 7 functions the driver uses. That covers the CCID
+  ProxKeys (163c:0407/0417/0418), which Ubuntu's CCID driver already knows. The HID/UDK
+  models (0402/0412/0620/5471) need WatchData's own daemon, which the suite does not install.
+- **Two different tokens:** the first one plugged in wins. `P11_LIB=/path/to/driver.so` in
+  `~/.config/railway-dsc/suite.conf` picks one, but it is ignored while a token of another
+  make is plugged in (`doctor` says so). `P11_FORCE=1` uses it anyway.
 - `railway-dsc doctor` shows, for each plugged token, which driver will be used or what
   to install.
 
@@ -165,6 +183,39 @@ NIC's jar is never modified. Everything is done around it:
 | The signer answers 401 "Invalid Request." to any Host other than `eoffsigner.eoffice.gov.in` | `/etc/hosts` maps that name to loopback |
 | The signer listens on all network interfaces by default | binds it to the loopback address only (`--server.address`) |
 | Old setups (7.0.6 service, v4 compatibility bridge on 55101, vendor `/etc/profile.d` autostart hook) conflict | disabled automatically; their files are kept |
+| **DSCSN05** after the certificate is found: on Linux the signer reads the DSC's chain only from the token and silently drops a DSC whose chain has two certificates or fewer (Windows fills the chain from its certificate store) | a small agent (`-javaagent`, source in `extras/chain-fill/`) fills in the CA certificates. See [DSCSN05](#dscsn05-the-certificate-chain) |
+
+### DSCSN05: the certificate chain
+
+eOffice answers DSCSN05 when the signer sends no certificate for the DSC registered on the
+server. NIC's 4.1.8 code (`in.gov.nic.dsc.util.c`, getAllCertificates) drops a DSC without a
+message when `getCertificateChain()` returns two certificates or fewer. On Windows that chain
+comes from the Windows certificate store. On Linux it comes from the token alone, and many
+tokens hold only the DSC itself, or the DSC and its Sub-CA.
+
+The suite's chain agent offers the `PKCS11` key store type ahead of SunPKCS11 and passes every
+call through to it. The only change is in `getCertificateChain()`: a chain with two certificates
+or fewer is completed from these sources, in order:
+
+1. CA certificates stored on the token.
+2. The CA files in `~/.local/share/railway-dsc/ca/`. The suite ships the CCA India 2022 and
+   2022 SPL roots from cca.gov.in and the eMudhra 2022 CAs; you can add your own `.cer`, `.crt`
+   or `.pem` files there.
+3. The issuer named in the certificate's own "CA Issuers" (AIA) address, downloaded over the
+   internet and kept in `ca/fetched/`. This covers every Indian licensed CA (eMudhra, Capricorn,
+   ProDigiSign, (n)Code, Vsign, …) without bundling each one.
+
+A CA certificate is added only if its signature over the certificate below it verifies. The
+completed chain is used only if it ends at a pinned CCA India root (SHA-256 fingerprints in
+`ChainFillAgent.java`). A forged "CCA India 2022" root is refused. A chain the token already
+completes is returned unchanged. Nothing is switched off: validity, revocation and the DSC
+registration are still checked by the eOffice server. The token is only read and never written,
+and NIC's jar is not changed. To turn the agent off, set `DSC_CHAIN_FILL=no` in `suite.conf`.
+
+`railway-dsc doctor` shows how many certificates the token holds (public objects only, no PIN)
+and the serial number of each signing DSC. It also shows the agent's last result from the
+signer log. If DSCSN05 remains after the chain has been completed, the DSC on the token is not
+the one registered in eOffice, and it has to be registered again there.
 
 ## Look and scaling
 
@@ -217,6 +268,7 @@ Start with `railway-dsc doctor`. Common messages from the portals:
 |---|---|
 | "Unable to connect with DSC service application. Verify Network." | nothing is answering on 55101. Run `railway-dsc status` |
 | "Either Response size is heavy or it is a Browser compatibility issue" | the signer answered with an HTTP error: often a 401 Host mismatch, or a PIN window that cannot open because the signer lost its display (doctor: "cannot open its PIN window"; fixed by `railway-dsc restart`, and by the watchdog within 3 minutes). Run `railway-dsc doctor` |
+| "DSCSN05" | no usable DSC from the token: usually the token lacks the CA certificates (completed by the suite's chain agent), otherwise the DSC is not the one registered in eOffice. See [DSCSN05](#dscsn05-the-certificate-chain) and `railway-dsc doctor` |
 | "Mismatch in DSC version" | the portal expects another signer version (e.g. 7.x); check the portal's `dscVersion` |
 | "Please check the signer service: [object Event]" (CRIS/IREPS) | the browser refused the local certificate. Run `railway-dsc trust`; in Firefox also open `https://127.0.0.1:2039` once and accept |
 | Document Viewer closes as soon as a signed PDF is opened | AppArmor blocks the token driver. Run `railway-dsc install` (or see `railway-dsc doctor`, section *PDF signing*) |
@@ -281,5 +333,14 @@ installers, from a `.run` bundle you build yourself, or from an existing install
   (dry run) chose to restart a signer on `:1024` and did nothing when no desktop display
   worked; the launcher picked the session display over an inherited stale one. Found
   when eOffice signing failed with the message above after a re-login on 2026-11-15.
+- Token drivers (4.7.0): the eMudhra and Hypersecu downloads were unpacked and checked by
+  checksum in a throwaway home, and a second run changed nothing. On this laptop the sudo
+  phase installed the drivers and added the InnaIT ids to the CCID list, with a consistent
+  backup. The ProxKey driver finds its libraries through the compatibility links. None of
+  the new drivers has been tried with a real token.
+- DSCSN05 chain agent (4.7.0): it completed eMudhra chains offline and by downloading from
+  the CA's own address; it refused a forged "CCA India 2022" root; a wrong PIN still gives
+  NIC's "load failed"; the token's key still signs through the wrapper; the real 4.1.8
+  signer starts and runs with it. Not yet tried with a token that holds a short chain.
 - Not yet tested: the sudo phase on non-Ubuntu distributions, and the non-systemd
   supervisor running real services.
