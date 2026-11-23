@@ -38,7 +38,7 @@
 set -u
 set -o pipefail
 
-SUITE_VERSION="4.7.0"
+SUITE_VERSION="4.8.0"
 MARKER="__PAYLOAD_BELOW__"
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
 
@@ -728,6 +728,12 @@ OPTS=("$NOATK" "-Djava.util.Arrays.useLegacyMergeSort=true" "${UI[@]}"
       "--add-exports=jdk.crypto.cryptoki/sun.security.pkcs11=ALL-UNNAMED"
       "--add-opens=jdk.crypto.cryptoki/sun.security.pkcs11=ALL-UNNAMED"
       "--add-opens=java.base/java.lang=ALL-UNNAMED"
+      # emaspdf.sign.Websigner (CRIS + IREPS PDF signing, e.g. IRWCMS) uses X500Name/PKCS7 directly;
+      # without these the Sign button throws IllegalAccessError and the PIN window just comes back.
+      "--add-exports=java.base/sun.security.x509=ALL-UNNAMED"
+      "--add-exports=java.base/sun.security.pkcs=ALL-UNNAMED"
+      "--add-exports=java.base/sun.security.util=ALL-UNNAMED"
+      "--add-exports=java.base/sun.security.action=ALL-UNNAMED"
       "--add-opens=java.desktop/javax.swing=ALL-UNNAMED"
       "--add-opens=java.desktop/java.awt=ALL-UNNAMED"
       "--add-opens=java.desktop/sun.awt=ALL-UNNAMED"

@@ -342,5 +342,11 @@ installers, from a `.run` bundle you build yourself, or from an existing install
   the CA's own address; it refused a forged "CCA India 2022" root; a wrong PIN still gives
   NIC's "load failed"; the token's key still signs through the wrapper; the real 4.1.8
   signer starts and runs with it. Not yet tried with a token that holds a short chain.
+- CRIS/IREPS PDF signing on Java 17 (4.8.0): pressing Sign threw `IllegalAccessError` for
+  `sun.security.x509.X500Name`, so the PIN window came back again and again on IRWCMS. The launcher
+  now exports `sun.security.{x509,pkcs,util,action}` from `java.base`; IRWCMS signing with a real
+  mToken and PIN then worked (2026-11-23).
+- Multi-page `sign-pdf` and the draw window (4.8.0): tested with a throwaway certificate only;
+  whether a real token allows several signatures in one login has not been tried yet.
 - Not yet tested: the sudo phase on non-Ubuntu distributions, and the non-systemd
   supervisor running real services.
