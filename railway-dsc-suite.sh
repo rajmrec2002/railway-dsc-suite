@@ -38,7 +38,7 @@
 set -u
 set -o pipefail
 
-SUITE_VERSION="4.8.0"
+SUITE_VERSION="4.9.0"
 MARKER="__PAYLOAD_BELOW__"
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
 
@@ -62,7 +62,8 @@ E7_PORT=55103
 LEGACY_706_DIR="/usr/local/DigitalSignerService-7.0.6"
 VENDOR_HOOK="/etc/profile.d/DSC706-start.sh"
 MTOKEN_LIB="/usr/lib/libcryptoid_pkcs11.so"
-UDEV_RULE="/etc/udev/rules.d/90-dsc-tokens.rules"
+UDEV_RULE="/etc/udev/rules.d/70-dsc-tokens.rules"      # before 73-seat-late.rules, which acts on TAG "uaccess"
+UDEV_RULE_OLD="/etc/udev/rules.d/90-dsc-tokens.rules"  # up to 4.8: too late for uaccess, and its lines did not parse
 LEGACY_UNITS="eofficesigner eofficesigner-proxy"     # 7.0.6 signer and the old v4 bridge
 # PDF signing: the Indian root CA (public; https://cca.gov.in), pinned; pyHanko versions tested
 CCA_ROOT_SHA256="9A:3F:D3:17:67:98:E8:42:DD:CB:12:C2:62:F1:1C:FA:CC:A7:0A:8B:84:C6:EA:6F:DA:30:84:2A:95:A9:4C:D8"
@@ -165,16 +166,24 @@ sha()  { sha256sum "$1" 2>/dev/null | cut -d' ' -f1; }
 have_systemd_user() { [ "${RDSC_NO_SYSTEMD:-}" != 1 ] && have systemctl && systemctl --user show-environment >/dev/null 2>&1; }
 
 hook_active() { [ -f "$VENDOR_HOOK" ] && grep -Eq '^[^#]*DigitalSignerService' "$VENDOR_HOOK" 2>/dev/null; }
-udev_rule_present() { [ -f "$UDEV_RULE" ] || grep -rqsiE 'idVendor.{0,6}(055c|096e|163c|0529)' /etc/udev/rules.d/ 2>/dev/null; }
-udev_rule_current() { [ -f "$UDEV_RULE" ] && [ "$(cat "$UDEV_RULE")" = "$(udev_rule_text)" ]; }   # ours, and lists every token below
+vendor_udev_rule() { grep -rlsiE 'idVendor.{0,6}(055c|096e|163c|0529)' /etc/udev/rules.d/ 2>/dev/null | grep -v 'dsc-tokens\.rules$' | head -1; }
+udev_rule_current() { [ -f "$UDEV_RULE" ] && [ ! -f "$UDEV_RULE_OLD" ] && [ "$(cat "$UDEV_RULE")" = "$(udev_rule_text)" ]; }   # ours, and lists every token below
 udev_rule_text() {
     echo "# Railway DSC suite: give the logged-in desktop user raw USB access to DSC tokens"
     echo "# (drivers such as the Longmai mToken talk to the token over USB, not PC/SC)."
     local t; for t in $TOKEN_VIDS; do
         case "${t%%:*}" in 04e6|072f) continue;; esac       # card readers are handled by pcscd
-        echo "SUBSYSTEM==\"usb\", ATTRS{idVendor}==\"${t%%:*}\", TAG+=\"uaccess\"   # ${t#*:}"
+        echo "# ${t#*:}"                                   # udev allows no comment after a rule
+        echo "SUBSYSTEM==\"usb\", ATTRS{idVendor}==\"${t%%:*}\", TAG+=\"uaccess\""
     done
-    echo "SUBSYSTEM==\"hidraw\", ATTRS{idVendor}==\"338c\", TAG+=\"uaccess\"   # InnaIT-KeyDSC (fingerprint models)"
+    echo "# InnaIT-KeyDSC (fingerprint models)"
+    echo "SUBSYSTEM==\"hidraw\", ATTRS{idVendor}==\"338c\", TAG+=\"uaccess\""
+    [ -n "$(ccid_plist)" ] || return 0
+    echo "# Any smart-card (CCID) token plugged in: add its id to the CCID driver's list if it is missing"
+    local run="$SYS_HELPER __ccid-sync"
+    local sc; for sc in /usr/bin/systemctl /bin/systemctl; do [ -x "$sc" ] && break; done   # udev RUN needs a full path
+    tokens_systemd && [ -x "$sc" ] && run="$sc --no-block start $TOKENS_UNIT.service"
+    echo "ACTION==\"add\", SUBSYSTEM==\"usb\", ENV{DEVTYPE}==\"usb_interface\", ATTR{bInterfaceClass}==\"0b\", RUN+=\"$run\""
 }
 hosts_addr()  { getent hosts "$HOSTS_NAME" 2>/dev/null | awk '{print $1; exit}'; }
 hosts_ok()    { case "$(hosts_addr)" in 127.*) return 0;; *) return 1;; esac; }
@@ -207,6 +216,12 @@ HYPERSECU_LIB="$VDRV_DIR/hypersecu/libcastle_v2.so.1.0.0"
 INNAIT_LIB="$VDRV_DIR/innait/libInnaITPKCS11Driver.so"
 PROXKEY_LIB="/usr/lib/WatchData/ProxKey/lib/libwdpkcs_SignatureP11.so"
 PROXKEY_COMPAT="/usr/lib/WatchData/pcsc"   # the ProxKey driver's built-in library path (RPATH)
+# Automatic reader-id registration (root side): a smart-card (CCID class) token that libccid does
+# not list is added to its Info.plist as soon as it is plugged in, and again after a libccid update.
+RAW_USB_VIDS="055c"                        # tokens whose driver talks raw USB: pcscd must never claim them
+CCID_SEEN="/var/lib/railway-dsc/ccid-ids"  # every id the suite added (vid:pid:name), re-added after updates
+SYS_HELPER="$VDRV_DIR/railway-dsc"         # root-owned copy of this script, run by the service below
+TOKENS_UNIT="railway-dsc-tokens"           # /etc/systemd/system/$TOKENS_UNIT.{service,path}
 plugged_vids() { cat /sys/bus/usb/devices/*/idVendor 2>/dev/null | sort -u; }
 p11_for_vid() {               # USB vendor id of the plugged token -> its drivers, best first
     case "$1" in
@@ -231,6 +246,18 @@ p11_override_fits() {         # $1 = P11_LIB entry: used unless it is another to
     [ $any = 0 ] && return 0                         # no known token plugged: nothing to contradict it
     for kn in $TOKEN_VIDS; do case " $(p11_for_vid "${kn%%:*}") " in *" $1 "*) return 1;; esac; done
     return 0                                          # a driver of no known token: the user's own choice
+}
+known_token_plugged() { local v; for v in $(plugged_vids); do [ -n "$(p11_for_vid "$v")" ] && return 0; done; return 1; }
+signer_p11() {                # $1 = service: the token driver it was started with
+    local p
+    case "$1" in
+        eoffice)  sed -n 's/^library *= *//p' "$EOFFICE_P11CFG" 2>/dev/null | head -1;;
+        eoffice7) sed -n 's/^1\.path=//p' "$E7_DIR/conf/all_tokens.properties" 2>/dev/null | head -1;;
+        cris|ireps)                                   # the launcher passes it on the java command line
+            p=$(svc_pid "$1"); [ -n "$p" ] && [ "$p" != 0 ] && [ -r "/proc/$p/cmdline" ] || return 1
+            tr '\0' '\n' < "/proc/$p/cmdline" | sed -n 's/^-Dwebsigner\.pkcs11\.library=//p' | head -1;;
+        *) return 1;;
+    esac
 }
 find_p11_lib() {              # P11_LIB (suite.conf, if it suits the plugged token) > plugged token's driver > first found
     local l v known=0 c
@@ -797,8 +824,7 @@ unit_names() { local s o=""; for s in $SVCS; do o="$o $(svc_unit "$s").service";
 
 install_self() {              # copy this script WITHOUT the payload to ~/.local/bin
     mkdir -p "$(dirname "$BIN")"
-    local n; n=$(grep -a -n -m1 "^${MARKER}\$" "$SELF" | cut -d: -f1)
-    if [ -n "$n" ]; then head -n "$((n-1))" "$SELF" > "$BIN.tmp"; else cat "$SELF" > "$BIN.tmp"; fi
+    self_script > "$BIN.tmp"
     chmod 755 "$BIN.tmp"; mv -f "$BIN.tmp" "$BIN"
 }
 
@@ -1212,14 +1238,34 @@ want = (int(sys.argv[2], 16), int(sys.argv[3], 16))
 sys.exit(0 if want in {(int(v, 16), int(p, 16)) for v, p in zip(d["ifdVendorID"], d["ifdProductID"])} else 1)
 PY
 }
-ccid_missing() {              # CCID_ADD entries still to add: for tokens whose driver is here or that are plugged in
+ccid_class_plugged() {        # vid:pid:name of each plugged device with a smart-card (CCID, class 0b) interface
+    local i d v p n
+    for i in /sys/bus/usb/devices/*:*; do
+        [ "$(cat "$i/bInterfaceClass" 2>/dev/null)" = 0b ] || continue
+        d=${i%:*}; v=$(cat "$d/idVendor" 2>/dev/null); p=$(cat "$d/idProduct" 2>/dev/null)
+        case "$v:$p" in [0-9a-f][0-9a-f][0-9a-f][0-9a-f]:[0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;; *) continue;; esac
+        case " $RAW_USB_VIDS " in *" $v "*) continue;; esac
+        n=$(head -c 64 "$d/product" 2>/dev/null | tr -c 'A-Za-z0-9.-' '_' | sed 's/^_*//; s/_*$//' | cut -c1-40)
+        echo "$v:$p:${n:-USB_token}"
+    done
+}
+ccid_missing() {              # reader ids still to add to libccid's list:
+    #   CCID_ADD entries for tokens whose driver is here or that are plugged in, every plugged
+    #   smart-card class device, and the ids added earlier (a libccid update drops them)
     local e v p have_drv plugged; plugged=$(plugged_vids)
     [ -n "$(ccid_plist)" ] || return 0
-    for e in $CCID_ADD; do
-        v=${e%%:*}; p=${e#*:}; p=${p%%:*}; have_drv=""
-        case "$v" in 2ccf) [ -f "$HYPERSECU_LIB" ] || [ -f "$DRV_CACHE/hypersecu/$(drv_file hypersecu)" ] && have_drv=1;;
-                     338c) [ -f "$INNAIT_LIB" ] || [ -f "$DRV_CACHE/innait/$(drv_file innait)" ] && have_drv=1;; esac
-        { [ -n "$have_drv" ] || printf '%s\n' "$plugged" | grep -qx "$v"; } && ! ccid_has "$v" "$p" && echo "$e"
+    {
+        for e in $CCID_ADD; do
+            v=${e%%:*}; have_drv=""
+            case "$v" in 2ccf) [ -f "$HYPERSECU_LIB" ] || [ -f "$DRV_CACHE/hypersecu/$(drv_file hypersecu)" ] && have_drv=1;;
+                         338c) [ -f "$INNAIT_LIB" ] || [ -f "$DRV_CACHE/innait/$(drv_file innait)" ] && have_drv=1;; esac
+            { [ -n "$have_drv" ] || printf '%s\n' "$plugged" | grep -qx "$v"; } && echo "$e"
+        done
+        ccid_class_plugged
+        [ -f "$CCID_SEEN" ] && grep -E '^[0-9a-fA-F]{4}:[0-9a-fA-F]{4}:[A-Za-z0-9._-]+$' "$CCID_SEEN"
+    } | awk -F: '!seen[tolower($1 ":" $2)]++' | while IFS=: read -r v p e; do
+        case " $RAW_USB_VIDS " in *" $v "*) continue;; esac
+        ccid_has "$v" "$p" || echo "$v:$p:$e"
     done
 }
 ccid_register() {             # root: add reader ids to libccid's Info.plist (backup kept; libccid updates undo it - doctor notices)
@@ -1250,8 +1296,52 @@ os.chmod(tmp, os.stat(path).st_mode & 0o7777)
 os.replace(tmp, path)
 PY
     then ok "smart-card reader list: added ${add[*]//_/ }"
+         mkdir -p "$(dirname "$CCID_SEEN")" && chmod 755 "$(dirname "$CCID_SEEN")"
+         { [ -f "$CCID_SEEN" ] && cat "$CCID_SEEN"; printf '%s\n' "${add[@]}"; } | grep -E '^[0-9a-fA-F]{4}:[0-9a-fA-F]{4}:[A-Za-z0-9._-]+$' | awk -F: '!s[tolower($1 ":" $2)]++' > "$CCID_SEEN.tmp" \
+             && chmod 644 "$CCID_SEEN.tmp" && mv -f "$CCID_SEEN.tmp" "$CCID_SEEN"
+         # pcscd reads the list only when it starts; a running one would ignore the new token
          have systemctl && systemctl try-restart pcscd.service >/dev/null 2>&1 || true
     else warn "could not add the token ids to $p (left unchanged)"; fi
+}
+self_script() { local n; n=$(grep -a -n -m1 "^${MARKER}\$" "$SELF" | cut -d: -f1)   # this script without the payload
+    if [ -n "$n" ]; then head -n "$((n-1))" "$SELF"; else cat "$SELF"; fi; }
+tokens_service_text() {
+    printf '%s\n' "[Unit]" "Description=Railway DSC suite: add newly plugged smart-card tokens to the CCID reader list" \
+        "Documentation=https://github.com/rajmrec2002/railway-dsc-suite" "" \
+        "[Service]" "Type=oneshot" "ExecStart=$SYS_HELPER __ccid-sync" "" "[Install]" "WantedBy=multi-user.target"
+}
+tokens_path_text() {          # $1 = libccid's Info.plist: a package update rewrites it and drops the added ids
+    printf '%s\n' "[Unit]" "Description=Railway DSC suite: re-add token ids after a libccid update" "" \
+        "[Path]" "PathChanged=$1" "Unit=$TOKENS_UNIT.service" "" "[Install]" "WantedBy=multi-user.target"
+}
+tokens_systemd() { have systemctl && [ -d /run/systemd/system ]; }
+tokens_hook_current() {       # automatic registration installed and from this version (true when there is no libccid)
+    local p; p=$(ccid_plist); [ -n "$p" ] || return 0
+    [ -x "$SYS_HELPER" ] && cmp -s <(self_script) "$SYS_HELPER" || return 1
+    tokens_systemd || return 0                                   # without systemd the udev rule runs the helper itself
+    [ "$(cat "/etc/systemd/system/$TOKENS_UNIT.service" 2>/dev/null)" = "$(tokens_service_text)" ] \
+        && [ "$(cat "/etc/systemd/system/$TOKENS_UNIT.path" 2>/dev/null)" = "$(tokens_path_text "$p")" ] \
+        && systemctl is-enabled --quiet "$TOKENS_UNIT.path" 2>/dev/null
+}
+install_tokens_hook() {       # root: the helper, the service the udev rule starts, and the libccid watch
+    local p; p=$(ccid_plist); [ -n "$p" ] || return 0
+    tokens_hook_current && return 0
+    mkdir -p "$VDRV_DIR" && chmod 755 "$VDRV_DIR"
+    self_script > "$SYS_HELPER.tmp" && chown root:root "$SYS_HELPER.tmp" && chmod 755 "$SYS_HELPER.tmp" && mv -f "$SYS_HELPER.tmp" "$SYS_HELPER" \
+        || { warn "could not install $SYS_HELPER"; return 1; }
+    if tokens_systemd; then
+        tokens_service_text > "/etc/systemd/system/$TOKENS_UNIT.service"
+        tokens_path_text "$p" > "/etc/systemd/system/$TOKENS_UNIT.path"
+        systemctl daemon-reload
+        systemctl enable "$TOKENS_UNIT.service" >/dev/null 2>&1
+        systemctl enable --now "$TOKENS_UNIT.path" >/dev/null 2>&1 || { warn "could not enable $TOKENS_UNIT.path"; return 1; }
+    fi
+    ok "new smart-card tokens are now added to the reader list automatically when plugged in"
+}
+cmd_ccid_sync() {             # internal, root: run by $TOKENS_UNIT.service (udev, boot, libccid update)
+    [ "$(id -u)" -eq 0 ] || die "__ccid-sync must run as root"
+    if have flock; then exec 9>/run/railway-dsc-ccid.lock; flock -w 60 9 || exit 0; fi
+    ccid_register
 }
 install_vendor_drivers() {    # root.  $1 = the user's $DRV_CACHE
     local k f t
@@ -1313,7 +1403,9 @@ cmd_root() {                  # internal: runs under sudo.  args: user payload_d
         install -o root -g root -m 0644 "$payload/drivers/libcryptoid_pkcs11.so" "$MTOKEN_LIB" && ok "mToken PKCS#11 driver installed"
     fi
     ccid_register
-    if [ -d /etc/udev/rules.d ] && { [ -f "$UDEV_RULE" ] || ! udev_rule_present; } && ! udev_rule_current; then
+    install_tokens_hook
+    if [ -d /etc/udev/rules.d ] && ! udev_rule_current; then      # also next to a vendor's rule: ours adds the hotplug hook
+        rm -f "$UDEV_RULE_OLD"
         udev_rule_text > "$UDEV_RULE"
         udevadm control --reload-rules 2>/dev/null; udevadm trigger --subsystem-match=usb 2>/dev/null
         ok "udev rule for DSC tokens installed (re-plug the token once)"
@@ -1650,7 +1742,7 @@ cmd_install() {
     have unzip || reasons+=("unzip")
     xlibs_missing && reasons+=("X11/font libraries for Java")
     [ ! -f "$MTOKEN_LIB" ] && [ -n "$PAYLOAD" ] && [ -f "$PAYLOAD/drivers/libcryptoid_pkcs11.so" ] && [ "$(uname -m)" = x86_64 ] && reasons+=("mToken driver")
-    [ -d /etc/udev/rules.d ] && { [ -f "$UDEV_RULE" ] || ! udev_rule_present; } && ! udev_rule_current && reasons+=("udev rule for DSC tokens")
+    [ -d /etc/udev/rules.d ] && ! udev_rule_current && reasons+=("udev rule for DSC tokens")
     hosts_ok || reasons+=("/etc/hosts entry")
     hook_active && reasons+=("disable the vendor autostart hook")
     smartcard_stack_ok || reasons+=("smart-card service + OpenSC (ePass2003 and smart cards)")
@@ -1661,6 +1753,7 @@ cmd_install() {
         [ -n "$DRV_PENDING" ] && { epass="$DRV_CACHE"; reasons+=("token drivers ($DRV_PENDING)"); }
         [ -f "$PROXKEY_LIB" ] && ! proxkey_compat_ok && { epass="$DRV_CACHE"; reasons+=("ProxKey driver libraries"); }
     fi
+    tokens_hook_current || reasons+=("automatic registration of newly plugged tokens")
     [ -n "$(ccid_missing)" ] && reasons+=("smart-card reader ids ($(ccid_missing | cut -d: -f1,2 | paste -sd' ' -))")
     local npdf=0
     if [ "$DSC_PDF" = yes ]; then
@@ -1680,7 +1773,7 @@ cmd_install() {
             exit 1
         fi
     elif [ ${#reasons[@]} -gt 0 ]; then
-        warn "Skipped (--no-root): ${reasons[*]}"
+        warn "Skipped (--no-root): $(IFS=,; echo "${reasons[*]}" | sed 's/,/, /g')"
     else
         ok "Nothing needs administrator rights"
     fi
@@ -1866,7 +1959,26 @@ heal_once() {
             done
         done
     fi
-    # 5. liveness
+    # 5. token driver: the signers and Document Viewer take the driver of the token plugged in when
+    #    they start / are installed; a token plugged in later (another make) needs its own driver
+    local p11 cur
+    if known_token_plugged && p11=$(find_p11_lib) && [ -n "$p11" ]; then
+        for s in $SVCS; do
+            svc_active "$s" && [ "$(svc_age "$s")" -ge 60 ] || continue
+            cur=$(signer_p11 "$s") || continue
+            [ "$cur" = "$p11" ] && continue
+            if [ "$dry" = 0 ]; then
+                svc_restart "$s"; hlog "RESTARTED $(svc_label "$s"): token driver $cur -> $p11 (another token is plugged in)"
+            else echo "would restart $(svc_label "$s"): token driver $cur -> $p11"; fi
+        done
+        if have modutil && [ -f "$NSSDB/cert9.db" ] && ! nss_has_lib "$p11"; then
+            if [ "$dry" = 1 ]; then echo "would register $p11 for Document Viewer"
+            elif modutil -dbdir "sql:$NSSDB" -add "DSC token ($(basename "$p11"))" -libfile "$p11" -force >/dev/null 2>&1; then
+                hlog "REGISTERED token driver for Document Viewer: $p11 (reopen Document Viewer)"
+            else hlog "ERROR could not register $p11 in $NSSDB"; fi
+        fi
+    fi
+    # 6. liveness
     for s in $SVCS; do
         local why="" cnt=0
         case " $repaired " in *" $s "*) why="program file repaired";; esac
@@ -1893,14 +2005,14 @@ heal_once() {
             svc_restart "$s"; hlog "RESTARTED $(svc_label "$s"): $why"
         else echo "would restart $(svc_label "$s"): $why"; fi
     done
-    # 6. log growth
+    # 7. log growth
     local lf
     for lf in "$EOFFICE_LOGS/output.log" "$EOFFICE_LOGS/error.log" "$E7_LOGS/output.log" "$E7_LOGS/errorOutput.log" "$HEAL_LOG"; do
         if [ -f "$lf" ] && [ "$(stat -c %s "$lf" 2>/dev/null || echo 0)" -gt 20971520 ] && [ "$dry" = 0 ]; then
             tail -c 2097152 "$lf" > "$lf.1" 2>/dev/null && : > "$lf" && hlog "ROTATED $lf"
         fi
     done
-    # 7. things only an administrator can fix: report, once a day
+    # 8. things only an administrator can fix: report, once a day
     local drift=""
     hook_active && drift="$drift vendor-autostart-hook-is-back"
     hosts_ok || drift="$drift hosts-entry-missing"
@@ -2020,6 +2132,13 @@ doctor_chain() {
     printf '         %s\n' "If eOffice still says DSCSN05, this serial must match the DSC registered in eOffice (re-register it there)."
 }
 
+doctor_signer_p11() {         # $1 = service: warn when its config names another token's driver
+    local cur p11
+    known_token_plugged && p11=$(find_p11_lib) && [ -n "$p11" ] && cur=$(signer_p11 "$1") || return 0
+    [ "$cur" = "$p11" ] && return 0
+    d_warn "$(svc_label "$1") uses ${cur:-no driver}, but the plugged token needs $p11"
+    d_fix "railway-dsc restart   (or wait: the watchdog restarts it within 3 minutes)"
+}
 cmd_doctor() {
     echo "${B}Railway DSC Signer Suite $SUITE_VERSION - doctor${N}  ($(date '+%F %T'))"
     [ -f "$CONF_FILE" ] && . "$CONF_FILE"
@@ -2057,10 +2176,12 @@ cmd_doctor() {
     if svc_wanted eoffice7 && [ -f "$E7_JAR" ]; then
         [ "$(sha "$E7_JAR")" = "$E7_JAR_SHA" ] && d_ok "eOffice jar is the genuine NIC 7.0.6 build" || { d_fail "7.0.6 jar checksum mismatch (damaged or patched)"; d_fix "railway-dsc heal"; }
         grep -qs '^1.path=' "$E7_DIR/conf/all_tokens.properties" && d_ok "7.0.6 token list -> $(sed -n 's/^1.path=//p' "$E7_DIR/conf/all_tokens.properties")" || { d_warn "7.0.6 has no token configured"; d_fix "railway-dsc install"; }
+        doctor_signer_p11 eoffice7
     fi
     if svc_wanted eoffice && [ -f "$EOFFICE_JAR" ]; then
         [ "$(sha "$EOFFICE_JAR")" = "$EOFFICE_JAR_SHA" ] && d_ok "eOffice jar is the genuine NIC 4.1.8 build" || { d_fail "eOffice jar checksum mismatch (damaged or not 4.1.8)"; d_fix "railway-dsc heal   (restores from the kept copy)"; }
         [ -f "$EOFFICE_P11CFG" ] && d_ok "pkcs11cfg -> $(sed -n 's/^library *= *//p' "$EOFFICE_P11CFG")" || { d_fail "pkcs11cfg missing - the eOffice signer cannot reach the token"; d_fix "railway-dsc install"; }
+        doctor_signer_p11 eoffice
         doctor_chain
     fi
     if [ -f "$MANIFEST" ]; then
@@ -2116,10 +2237,6 @@ cmd_doctor() {
             v="${t%%:*}"; nm="${t#*:}"; drv=""
             for l in $(p11_for_vid "$v"); do [ -f "$l" ] && { drv="$l"; break; }; done
             if [ -n "$drv" ]; then d_ok "$nm token -> driver $drv"
-                case "$v" in 2ccf|338c)
-                    for o in $(plugged_ids | grep "^$v:"); do
-                        case " $CCID_ADD " in *" ${o}:"*) ccid_has "$v" "${o#*:}" || { d_fail "  the smart-card service does not know this $nm model ($o)"; d_fix "railway-dsc install   (adds it to the CCID reader list; again after a libccid update)"; };; esac
-                    done;; esac
                 [ "$v" = 163c ] && [ "$drv" = "$PROXKEY_LIB" ] && ! proxkey_compat_ok && { d_fail "  ProxKey driver misses libraries"; d_fix "railway-dsc install"; }
                 [ "$v" = 163c ] && plugged_ids | grep -qE '^163c:(0402|0412|0620|5471)$' && [ ! -e "$PROXKEY_COMPAT/pcscd_wd" ] && { d_warn "  this ProxKey model needs WatchData's own smart-card service, which the suite does not install"; }
                 case " $OPENSC_LIBS " in *" $drv "*)
@@ -2150,10 +2267,16 @@ cmd_doctor() {
         if have ldd; then o=$(ldd "$j" 2>/dev/null | awk '/not found/{print $1}' | paste -sd' ' -); [ -n "$o" ] && { d_fail "driver needs missing libraries: $o"; d_fix "install those packages (Ubuntu: apt-file search <name>)"; }; fi
     else d_fail "no PKCS#11 driver found for any common token"; d_fix "install the token vendor's Linux driver (mToken: libcryptoid_pkcs11.so in /usr/lib)"; fi
     if udev_rule_current; then d_ok "udev rule for tokens present"
-    elif [ -f "$UDEV_RULE" ]; then d_warn "udev rule is from an older version (misses newer tokens)"; d_fix "railway-dsc install"
-    elif udev_rule_present; then d_ok "udev rule for tokens present (vendor's)"
+    elif [ -f "$UDEV_RULE" ] || [ -f "$UDEV_RULE_OLD" ]; then d_warn "udev rule is from an older version (before 4.9 its token lines were ignored by udev)"; d_fix "railway-dsc install   (asks for sudo)"
+    elif o=$(vendor_udev_rule) && [ -n "$o" ]; then d_warn "only the token vendor's udev rule ($o): new tokens are not registered automatically"; d_fix "railway-dsc install   (asks for sudo)"
     else d_warn "no udev rule - token may need root access"; d_fix "railway-dsc install"; fi
     if have systemctl && systemctl is-active --quiet pcscd.socket 2>/dev/null || pgrep -x pcscd >/dev/null 2>&1; then d_ok "pcscd available (smart-card readers)"; fi
+    if [ -n "$(ccid_plist)" ]; then
+        if tokens_hook_current; then d_ok "newly plugged smart-card tokens are added to the reader list automatically"
+        else d_warn "automatic registration of newly plugged tokens is missing or from an older version"; d_fix "railway-dsc install   (asks for sudo)"; fi
+        o=$(ccid_missing | cut -d: -f1,2 | paste -sd' ' -)
+        [ -n "$o" ] && { d_fail "the smart-card service does not know these token ids yet: $o"; d_fix "re-plug the token (the service adds them), or: railway-dsc install"; }
+    fi
 
     d_head "PDF signing"
     if [ "${DSC_PDF:-yes}" = no ]; then d_ok "switched off (DSC_PDF=no in suite.conf)"
@@ -2242,7 +2365,7 @@ cmd_uninstall() {
     rm -f "$AUTOSTART" "$BIN" "$PDF_BIN" "$PDF_DESKTOP" "$PDF_NAUTILUS"
     if [ $purge = 1 ]; then
         rm -rf "$SHARE_DIR" "$EOFFICE_DIR" "$CRIS_DIR" "$IREPS_DIR" "$CONF_DIR" "$PDF_VENV"
-        ok "Services and program files removed. Left in place (need root): $MTOKEN_LIB, $VDRV_DIR (token drivers), the reader ids in libccid's Info.plist (backup: .bak-railway-dsc), $UDEV_RULE, the /etc/hosts line, the AppArmor lines in /etc/apparmor.d/local/ and Document Viewer."
+        ok "Services and program files removed. Left in place (need root): $MTOKEN_LIB, $VDRV_DIR (token drivers), the reader ids in libccid's Info.plist (backup: .bak-railway-dsc) and the $TOKENS_UNIT service that adds them, $UDEV_RULE, the /etc/hosts line, the AppArmor lines in /etc/apparmor.d/local/ and Document Viewer."
     else
         rm -rf "$KEEP_DIR" "$STATE_DIR" "$LAUNCH" "$PROBE"
         ok "Services and watchdog removed; program files and Java runtimes kept (remove too with: uninstall --purge)."
@@ -2288,7 +2411,7 @@ EOF
 
 main() {
     local cmd="${1:-help}"; [ $# -gt 0 ] && shift
-    case "$cmd" in supervise|help|-h|--help) ;; *) init_work_tmp;; esac
+    case "$cmd" in supervise|help|-h|--help|__ccid-sync) ;; *) init_work_tmp;; esac
     case "$cmd" in
         install|repair) cmd_install "$@";;
         doctor)    cmd_doctor;;
@@ -2301,6 +2424,7 @@ main() {
         trust)     trust_certs;;
         uninstall) cmd_uninstall "$@";;
         __root)    cmd_root "$@";;
+        __ccid-sync) cmd_ccid_sync;;
         help|-h|--help) usage;;
         *) usage; exit 2;;
     esac

@@ -54,7 +54,8 @@ from Maven Central, each pinned by checksum.
 
        bash railway-dsc-suite.sh install
 
-   It asks for `sudo` only for system steps: packages, `/etc/hosts`, the udev rule and the token driver.
+   It asks for `sudo` only for system steps: packages, `/etc/hosts`, the udev rule, the token driver
+   and the service that registers newly plugged tokens.
 5. Log out of eOffice and log in again. When you sign, NIC's small **PIN window**
    appears. It may sit behind the browser.
 
@@ -88,10 +89,28 @@ The private `.run` bundle already carries the known builds.
   is used only when named: `railway-dsc install --driver=FILE` (`--epass-zip=FILE` still works).
 - Drivers are installed to `/usr/lib/railway-dsc/<vendor>/` (ProxKey:
   `/usr/lib/WatchData/ProxKey/lib/`), so clearing `~/Downloads` does not break them.
-- **Hypersecu / InnaIT:** Ubuntu's CCID driver does not list these tokens yet, so the suite adds
-  their USB ids to `ifd-ccid.bundle/Contents/Info.plist` (backup `Info.plist.bak-railway-dsc`) and
-  restarts `pcscd`. A `libccid` package update undoes this; `railway-dsc doctor` notices, and
-  `railway-dsc install` adds them again.
+- **New tokens are registered by themselves (4.9.0).** Smart-card tokens (Hypersecu, InnaIT,
+  ePass2003, ProxKey and others) reach the signers through `pcscd`, which only accepts USB ids
+  listed in Ubuntu's CCID driver list, `ifd-ccid.bundle/Contents/Info.plist`. The suite now
+  installs a small root service, `railway-dsc-tokens`, that adds the id of **any** token with a
+  smart-card (CCID) interface as soon as it is plugged in, and restarts `pcscd` so it is seen:
+  - a udev rule starts it whenever such a device is plugged in;
+  - a path unit starts it when a `libccid` package update rewrites the list, and every id the
+    suite added earlier (remembered in `/var/lib/railway-dsc/ccid-ids`) goes back in;
+  - it also runs at boot.
+
+  The first change to the list keeps a backup, `Info.plist.bak-railway-dsc`. Tokens whose
+  driver talks raw USB (Longmai mToken, `055c`) are never added, because `pcscd` would then take
+  the token away from its driver. Desktop-user access to the known tokens' USB devices comes
+  from the udev rule `/etc/udev/rules.d/70-dsc-tokens.rules`.
+  `railway-dsc doctor` lists any plugged token id that is still missing.
+- **Udev rule fixed (4.9.0).** Up to 4.8.0 the rule was `90-dsc-tokens.rules`, with a comment
+  after each rule. udev ignores such lines, and a `uaccess` tag set after `73-seat-late.rules`
+  has no effect, so that rule never granted anything. `install` replaces it with
+  `70-dsc-tokens.rules`.
+- **Changing tokens (4.9.0):** when a token of another make is plugged in, the watchdog restarts
+  any signer still started with the previous token's driver (within 3 minutes, or at once with
+  `railway-dsc restart`), and registers the new driver for Document Viewer.
 - **ProxKey:** the driver expects WatchData's own copy of pcsc-lite and the old `libxml2.so.2`.
   The suite puts two links in `/usr/lib/WatchData/pcsc/` (the driver's built-in library path,
   so nothing else on the system is affected): to the system `libpcsclite.so.1`, and to
@@ -348,5 +367,10 @@ installers, from a `.run` bundle you build yourself, or from an existing install
   mToken and PIN then worked (2026-11-23).
 - Multi-page `sign-pdf` and the draw window (4.8.0): tested with a throwaway certificate only;
   whether a real token allows several signatures in one login has not been tried yet.
+- Token hotplug (4.9.0): adding ids to a copy of the CCID list was tested, including keeping the
+  three columns the same length, skipping the mToken vendor, ignoring malformed remembered lines,
+  and a second run that changed nothing. The udev rule passes `udevadm verify`, while the 4.8.0
+  rule failed it. The units pass `systemd-analyze verify`. Not yet seen live: a real token being
+  added by the service on plug-in, and re-adding after a `libccid` update.
 - Not yet tested: the sudo phase on non-Ubuntu distributions, and the non-systemd
   supervisor running real services.
