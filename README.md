@@ -18,6 +18,8 @@ handles Debian/Mint/Pop!_OS, Fedora/RHEL, openSUSE, Arch, Alpine and Void.
 It also sets up **signing PDFs with the same DSC token** outside the portals (see
 [Signing PDFs](#signing-pdfs)).
 
+**Installing:** step-by-step commands for every distribution are in [INSTALL.md](INSTALL.md).
+
 ## Quick start on a new PC (Ubuntu)
 
 1. Download this repository (green **Code** button → *Download ZIP*) and unpack it, or
