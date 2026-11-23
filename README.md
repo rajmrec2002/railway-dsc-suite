@@ -142,7 +142,7 @@ Java 17 is installed). Like 4.1.8, it is bound to the loopback address only.
 - **Document Viewer (GNOME Papers)** is installed. It signs PDFs itself: open the PDF,
   choose to add a digital signature, draw the box, enter the token PIN, pick your
   certificate, then **Save Signed File**.
-- **`sign-pdf`**: `sign-pdf letter.pdf [--reason R] [--location L] [--page N] [--pos br|bl|tr|tl] [--invisible]`
+- **`sign-pdf`**: `sign-pdf letter.pdf [--reason R] [--location L] [--page N | --pages all|first|last|1,3,5-7] [--pos br|bl|tr|tl | --box l,t,r,b] [--draw|--no-draw] [--invisible]`
   writes `letter_signed.pdf` (PAdES, SHA-256, visible box at the bottom right of the last
   page by default) and checks it with `pdfsig`. The same is available as the app
   **Sign PDF with DSC** (also under *Open With* for PDFs) and in Files under
